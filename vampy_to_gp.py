@@ -1,10 +1,4 @@
 #!/usr/bin/env python3
-"""
-Выгружает данные из Vampy API в Greenplum (КХД 2.0)
-Схема: custom_ts_secure_development
-
-"""
-
 import os
 import logging
 import asyncio
@@ -12,18 +6,38 @@ import aiohttp
 import psycopg2
 from psycopg2.extras import execute_values
 from datetime import datetime, timezone
+from pathlib import Path
+
 
 # ============================================================
-# НАСТРОЙКИ — заполни в /etc/vampy-to-gp.env
+# Загрузка .env файла
 # ============================================================
-VAMPY_URL   = os.environ.get("VAMPY_URL",   "https://vampy.your-company.ru")
-VAMPY_TOKEN = os.environ.get("VAMPY_TOKEN", "your-bot-token")
-GP_HOST     = os.environ.get("GP_HOST",     "greenplum-host")
-GP_PORT     = os.environ.get("GP_PORT",     "5432")
-GP_DB       = os.environ.get("GP_DB",       "your-db-name")
-GP_USER     = os.environ.get("GP_USER",     "SA-SSP-G0002")
-GP_PASSWORD = os.environ.get("GP_PASSWORD", "your-password")
-GP_SCHEMA   = "custom_ts_secure_development"
+def load_env(path: str = "/home/akhvostovets/vampy-to-gp/.env"):
+    env_file = Path(path)
+    if not env_file.exists():
+        raise FileNotFoundError(f".env файл не найден: {path}")
+    with open(env_file) as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, value = line.partition("=")
+            os.environ.setdefault(key.strip(), value.strip())
+
+
+load_env()
+
+# ============================================================
+# НАСТРОЙКИ из .env
+# ============================================================
+VAMPY_URL   = os.environ["VAMPY_URL"]
+VAMPY_TOKEN = os.environ["VAMPY_TOKEN"]
+GP_HOST     = os.environ["GP_HOST"]
+GP_PORT     = os.environ.get("GP_PORT", "5050")
+GP_DB       = os.environ["GP_DB"]
+GP_USER     = os.environ["GP_USER"]
+GP_PASSWORD = os.environ["GP_PASSWORD"]
+GP_SCHEMA   = os.environ.get("GP_SCHEMA", "custom_ts_secure_development")
 
 CLOSED_STATUSES = {"Fixed", "False Positive", "Exclusion"}
 
@@ -68,11 +82,6 @@ def parse_dt(s) -> datetime | None:
         return None
 
 
-# ------------------------------------------------------------
-# Дефекты: GET /ext/v1/scan_issues/export/
-# Возвращает {"items": [...]} — всё одним запросом, без пагинации
-# Фильтруем только critical,high на стороне Vampy
-# ------------------------------------------------------------
 async def fetch_issues(session: aiohttp.ClientSession) -> list:
     log.info("Запрашиваем дефекты /ext/v1/scan_issues/export/ ...")
     async with session.get(
@@ -81,7 +90,7 @@ async def fetch_issues(session: aiohttp.ClientSession) -> list:
         params={
             "payload":    "INLINE",
             "formatter":  "JSON",
-            "severities": "critical,high",  # только нужные severity
+            "severities": "critical,high",
         },
         timeout=aiohttp.ClientTimeout(total=300)
     ) as r:
@@ -89,23 +98,16 @@ async def fetch_issues(session: aiohttp.ClientSession) -> list:
             text = await r.text()
             raise Exception(f"Ошибка API {r.status}: {text[:300]}")
         data = await r.json()
-
     items = data.get("items", [])
     log.info(f"Получено дефектов: {len(items)}")
     return items
 
 
-# ------------------------------------------------------------
-# Продукты: GET /ext/v1/products/
-# Есть пагинация: limit + offset + hasNext
-# Поля: id, name, slug, repositoriesCount, riskScore
-# ------------------------------------------------------------
 async def fetch_products(session: aiohttp.ClientSession) -> list:
     log.info("Запрашиваем продукты /ext/v1/products/ ...")
     all_products = []
     offset = 0
     limit  = 50
-
     while True:
         async with session.get(
             f"{VAMPY_URL}/ext/v1/products/",
@@ -114,56 +116,42 @@ async def fetch_products(session: aiohttp.ClientSession) -> list:
             timeout=aiohttp.ClientTimeout(total=60)
         ) as r:
             data = await r.json()
-
         items    = data.get("items", [])
         has_next = data.get("hasNext", False)
         total    = data.get("totalCount", "?")
         all_products.extend(items)
-
         log.info(f"Продукты: {len(all_products)} / {total}")
-
         if not has_next or not items:
             break
         offset += limit
-
     return all_products
 
 
-# ------------------------------------------------------------
-# Подготовка строк дефектов для INSERT
-# Поля из API: id, severity, status, product (slug),
-# repository (slug), parser, created, completed, sla
-# ------------------------------------------------------------
 def prepare_issue_rows(items: list, snapshot_ts: datetime) -> list:
     rows = []
     for item in items:
-        status   = normalize_status(item.get("status", ""))
-        severity = normalize_severity(item.get("severity", ""))
-        is_debt  = (status == "Security Debt")
+        status    = normalize_status(item.get("status", ""))
+        severity  = normalize_severity(item.get("severity", ""))
+        is_debt   = (status == "Security Debt")
         is_active = (status not in CLOSED_STATUSES)
-
         rows.append((
             snapshot_ts,
             str(item.get("id", "")),
-            str(item.get("product", "") or ""),     # product slug
-            str(item.get("product", "") or ""),     # product name (slug, уточним из products)
-            str(item.get("repository", "") or ""),  # repository slug
+            str(item.get("product", "") or ""),
+            str(item.get("product", "") or ""),
+            str(item.get("repository", "") or ""),
             severity,
             status,
-            str(item.get("parser", "") or ""),      # тип сканера
+            str(item.get("parser", "") or ""),
             is_debt,
             is_active,
             parse_dt(item.get("created")),
-            parse_dt(item.get("completed")),        # дата закрытия
-            parse_dt(item.get("sla")),              # дедлайн RA
+            parse_dt(item.get("completed")),
+            parse_dt(item.get("sla")),
         ))
     return rows
 
 
-# ------------------------------------------------------------
-# Подготовка строк продуктов для INSERT
-# Поля: id, name, slug, repositoriesCount
-# ------------------------------------------------------------
 def prepare_product_rows(products: list, snapshot_ts: datetime) -> list:
     rows = []
     for p in products:
@@ -176,23 +164,14 @@ def prepare_product_rows(products: list, snapshot_ts: datetime) -> list:
     return rows
 
 
-# ------------------------------------------------------------
-# Запись в Greenplum
-# ------------------------------------------------------------
-def save_to_greenplum(
-    issue_rows: list,
-    product_rows: list,
-    snapshot_ts: datetime
-):
+def save_to_greenplum(issue_rows: list, product_rows: list, snapshot_ts: datetime):
     dsn = (
         f"host={GP_HOST} port={GP_PORT} dbname={GP_DB} "
         f"user={GP_USER} password={GP_PASSWORD}"
     )
     conn = psycopg2.connect(dsn)
     cur  = conn.cursor()
-    cur.execute(f"SET search_path TO {GP_SCHEMA}")
 
-    # -- Дефекты --
     log.info(f"Пишем {len(issue_rows)} дефектов в issues_snapshot...")
     execute_values(cur, f"""
         INSERT INTO {GP_SCHEMA}.issues_snapshot (
@@ -202,7 +181,6 @@ def save_to_greenplum(
         ) VALUES %s
     """, issue_rows, page_size=500)
 
-    # -- Продукты --
     if product_rows:
         log.info(f"Пишем {len(product_rows)} продуктов в products_snapshot...")
         execute_values(cur, f"""
@@ -211,9 +189,7 @@ def save_to_greenplum(
             ) VALUES %s
         """, product_rows)
 
-    # -- Обновляем product_name в issues_snapshot по slug --
-    # product в дефектах приходит как slug, обновляем на реальное название
-    log.info("Обновляем названия продуктов в issues_snapshot...")
+    log.info("Обновляем названия продуктов...")
     cur.execute(f"""
         UPDATE {GP_SCHEMA}.issues_snapshot i
         SET product_name = p.product_name
@@ -223,22 +199,17 @@ def save_to_greenplum(
           AND p.ts = %s
     """, (snapshot_ts, snapshot_ts))
 
-    # -- Дневные агрегаты --
+    log.info("Обновляем дневные агрегаты...")
     today = snapshot_ts.date()
-    log.info("Обновляем дневные агрегаты issues_daily...")
-    cur.execute(
-        f"DELETE FROM {GP_SCHEMA}.issues_daily WHERE dt = %s", (today,)
-    )
+    cur.execute(f"DELETE FROM {GP_SCHEMA}.issues_daily WHERE dt = %s", (today,))
     cur.execute(f"""
         INSERT INTO {GP_SCHEMA}.issues_daily (
             dt, product_id, product_name,
             severity, status, scanner, is_security_debt, cnt
         )
         SELECT
-            DATE(ts),
-            product_id, product_name,
-            severity, status, scanner,
-            is_security_debt,
+            DATE(ts), product_id, product_name,
+            severity, status, scanner, is_security_debt,
             COUNT(DISTINCT issue_id)
         FROM {GP_SCHEMA}.issues_snapshot
         WHERE ts = (SELECT MAX(ts) FROM {GP_SCHEMA}.issues_snapshot)
@@ -253,9 +224,6 @@ def save_to_greenplum(
     log.info("Greenplum обновлён.")
 
 
-# ------------------------------------------------------------
-# Главная функция
-# ------------------------------------------------------------
 async def main():
     snapshot_ts = datetime.now(timezone.utc)
     log.info(f"=== Старт: {snapshot_ts} ===")
