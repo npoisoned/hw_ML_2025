@@ -1,0 +1,245 @@
+SET search_path TO custom_ts_secure_development;
+
+
+-- ------------------------------------------------------------
+-- 1. Основная таблица дефектов
+-- Сюда попадают только Critical и High из Vampy
+-- ------------------------------------------------------------
+DROP TABLE IF EXISTS issues_snapshot CASCADE;
+
+CREATE TABLE issues_snapshot (
+    ts               TIMESTAMP,
+    issue_id         TEXT,
+    product_id       TEXT,
+    product_name     TEXT,
+    repository       TEXT,
+    severity         TEXT,        -- CRITICAL / HIGH
+    status           TEXT,        -- New / Confirmed / Risk Accepted / Reopened /
+                                  -- Security Debt / Fixed / False Positive / Exclusion
+    scanner          TEXT,        -- SEMGREP / GRYPE / DAST и тд
+    is_security_debt BOOLEAN,     -- TRUE если Security Debt трек
+    is_active        BOOLEAN,     -- TRUE если открытый (не Fixed/FP/Exclusion)
+    created_at       TIMESTAMP,
+    updated_at       TIMESTAMP,   -- дата изменения статуса (completed из Vampy)
+    ra_deadline      TIMESTAMP    -- дедлайн Risk Accepted (sla из Vampy)
+) DISTRIBUTED BY (issue_id);
+
+
+-- ------------------------------------------------------------
+-- 2. Дневные агрегаты (для графиков динамики в FineBI)
+-- ------------------------------------------------------------
+DROP TABLE IF EXISTS issues_daily CASCADE;
+
+CREATE TABLE issues_daily (
+    dt               DATE,
+    product_id       TEXT,
+    product_name     TEXT,
+    severity         TEXT,
+    status           TEXT,
+    scanner          TEXT,
+    is_security_debt BOOLEAN,
+    cnt              INTEGER
+) DISTRIBUTED BY (product_id);
+
+
+-- ------------------------------------------------------------
+-- 3. Продукты из Vampy
+-- ------------------------------------------------------------
+DROP TABLE IF EXISTS products_snapshot CASCADE;
+
+CREATE TABLE products_snapshot (
+    ts           TIMESTAMP,
+    product_id   TEXT,
+    product_name TEXT,
+    repos_count  INTEGER
+) DISTRIBUTED BY (product_id);
+
+
+-- ============================================================
+-- VIEWS для FineBI
+-- Все views работают только с Critical и High
+-- ============================================================
+
+-- ------------------------------------------------------------
+-- 4. Красная зона — просроченные дедлайны прямо сейчас
+-- ------------------------------------------------------------
+DROP VIEW IF EXISTS red_zone;
+
+CREATE VIEW red_zone AS
+SELECT
+    issue_id,
+    product_name,
+    repository,
+    severity,
+    status,
+    scanner,
+    created_at,
+    ra_deadline,
+    EXTRACT(DAY FROM NOW() - ra_deadline)::INTEGER AS days_overdue
+FROM issues_snapshot
+WHERE
+    ts = (SELECT MAX(ts) FROM issues_snapshot)
+    AND severity IN ('CRITICAL', 'HIGH')
+    AND (
+        -- Risk Accepted Critical просрочен > 14 дней
+        (status = 'Risk Accepted' AND severity = 'CRITICAL'
+            AND ra_deadline IS NOT NULL AND ra_deadline < NOW())
+        OR
+        -- Risk Accepted High просрочен > 60 дней
+        (status = 'Risk Accepted' AND severity = 'HIGH'
+            AND ra_deadline IS NOT NULL AND ra_deadline < NOW())
+        OR
+        -- Confirmed Critical — всегда красная зона
+        (status = 'Confirmed' AND severity = 'CRITICAL')
+        OR
+        -- Confirmed High просрочен > 60 дней
+        (status = 'Confirmed' AND severity = 'HIGH'
+            AND updated_at < NOW() - INTERVAL '60 days')
+        OR
+        -- Security Debt после 01.01.2027
+        (is_security_debt = TRUE
+            AND is_active = TRUE
+            AND NOW() > TIMESTAMP '2027-01-01 00:00:00')
+        OR
+        -- Reopened Critical/High — всегда в красной зоне
+        (status = 'Reopened' AND severity IN ('CRITICAL', 'HIGH'))
+    )
+ORDER BY
+    CASE severity WHEN 'CRITICAL' THEN 1 WHEN 'HIGH' THEN 2 END,
+    days_overdue DESC NULLS LAST;
+
+
+-- ------------------------------------------------------------
+-- 5. Сводка по продуктам
+-- ------------------------------------------------------------
+DROP VIEW IF EXISTS products_current;
+
+CREATE VIEW products_current AS
+SELECT
+    product_id,
+    product_name,
+    COUNT(DISTINCT repository)                                           AS repos_count,
+    -- Critical открытых (не Security Debt)
+    COUNT(CASE WHEN severity = 'CRITICAL'
+               AND is_active = TRUE
+               AND is_security_debt = FALSE THEN 1 END)                 AS critical_open,
+    -- High открытых (не Security Debt)
+    COUNT(CASE WHEN severity = 'HIGH'
+               AND is_active = TRUE
+               AND is_security_debt = FALSE THEN 1 END)                 AS high_open,
+    -- Reopened Critical+High
+    COUNT(CASE WHEN status = 'Reopened' THEN 1 END)                     AS reopened_total,
+    -- Security Debt остаток
+    COUNT(CASE WHEN is_security_debt = TRUE
+               AND is_active = TRUE THEN 1 END)                         AS security_debt_total,
+    -- Security Debt Critical
+    COUNT(CASE WHEN is_security_debt = TRUE
+               AND is_active = TRUE
+               AND severity = 'CRITICAL' THEN 1 END)                    AS security_debt_critical,
+    -- Security Debt High
+    COUNT(CASE WHEN is_security_debt = TRUE
+               AND is_active = TRUE
+               AND severity = 'HIGH' THEN 1 END)                        AS security_debt_high,
+    -- Risk Accepted просроченные
+    COUNT(CASE WHEN status = 'Risk Accepted'
+               AND ra_deadline IS NOT NULL
+               AND ra_deadline < NOW() THEN 1 END)                      AS ra_overdue,
+    -- Confirmed Critical — блокируют релиз
+    COUNT(CASE WHEN status = 'Confirmed'
+               AND severity = 'CRITICAL' THEN 1 END)                    AS confirmed_critical,
+    -- Fixed за 30 дней
+    COUNT(CASE WHEN status = 'Fixed'
+               AND updated_at >= NOW() - INTERVAL '30 days' THEN 1 END) AS fixed_30d,
+    -- Exclusion (для информации)
+    COUNT(CASE WHEN status = 'Exclusion' THEN 1 END)                    AS exclusions
+FROM issues_snapshot
+WHERE ts = (SELECT MAX(ts) FROM issues_snapshot)
+GROUP BY product_id, product_name
+ORDER BY critical_open DESC;
+
+
+-- ------------------------------------------------------------
+-- 6. MTTR по продуктам (медиана дней от обнаружения до Fixed)
+-- ------------------------------------------------------------
+DROP VIEW IF EXISTS mttr_by_product;
+
+CREATE VIEW mttr_by_product AS
+SELECT
+    product_id,
+    product_name,
+    severity,
+    PERCENTILE_CONT(0.5) WITHIN GROUP (
+        ORDER BY EXTRACT(DAY FROM updated_at - created_at)
+    )::INTEGER AS mttr_days,
+    COUNT(*)   AS fixed_count
+FROM issues_snapshot
+WHERE
+    status = 'Fixed'
+    AND updated_at >= NOW() - INTERVAL '30 days'
+    AND created_at IS NOT NULL
+    AND updated_at IS NOT NULL
+    AND updated_at > created_at
+GROUP BY product_id, product_name, severity
+ORDER BY mttr_days ASC;
+
+
+-- ------------------------------------------------------------
+-- 7. Security Debt прогресс и прогноз к концу года
+-- ------------------------------------------------------------
+DROP VIEW IF EXISTS security_debt_progress;
+
+CREATE VIEW security_debt_progress AS
+SELECT
+    product_id,
+    product_name,
+    COUNT(CASE WHEN severity = 'CRITICAL'
+               AND is_active = TRUE THEN 1 END)                      AS debt_critical_open,
+    COUNT(CASE WHEN severity = 'HIGH'
+               AND is_active = TRUE THEN 1 END)                      AS debt_high_open,
+    COUNT(CASE WHEN status = 'Fixed'
+               AND updated_at >= NOW() - INTERVAL '30 days' THEN 1 END) AS fixed_last_30d,
+    EXTRACT(DAY FROM TIMESTAMP '2027-01-01 00:00:00' - NOW())::INTEGER  AS days_to_deadline
+FROM issues_snapshot
+WHERE
+    ts = (SELECT MAX(ts) FROM issues_snapshot)
+    AND is_security_debt = TRUE
+GROUP BY product_id, product_name
+ORDER BY debt_critical_open DESC;
+
+
+-- ------------------------------------------------------------
+-- 8. Эффективность устранения
+-- Показывает: закрыли дефекты — а риск вырос или снизился?
+-- delta > 0 = риск вырос, delta < 0 = риск снизился
+-- ------------------------------------------------------------
+DROP VIEW IF EXISTS effectiveness_by_product;
+
+CREATE VIEW effectiveness_by_product AS
+WITH
+fixed_30d AS (
+    SELECT product_id, product_name, severity, COUNT(*) AS cnt
+    FROM issues_snapshot
+    WHERE status = 'Fixed'
+      AND updated_at >= NOW() - INTERVAL '30 days'
+    GROUP BY product_id, product_name, severity
+),
+new_30d AS (
+    SELECT product_id, product_name, severity, COUNT(*) AS cnt
+    FROM issues_snapshot
+    WHERE status IN ('New', 'Reopened', 'Confirmed')
+      AND created_at >= NOW() - INTERVAL '30 days'
+      AND ts = (SELECT MAX(ts) FROM issues_snapshot)
+    GROUP BY product_id, product_name, severity
+)
+SELECT
+    COALESCE(f.product_id,   n.product_id)   AS product_id,
+    COALESCE(f.product_name, n.product_name) AS product_name,
+    COALESCE(f.severity,     n.severity)     AS severity,
+    COALESCE(f.cnt, 0)                       AS fixed_cnt,
+    COALESCE(n.cnt, 0)                       AS new_cnt,
+    COALESCE(n.cnt, 0) - COALESCE(f.cnt, 0) AS delta
+FROM fixed_30d f
+FULL OUTER JOIN new_30d n
+    ON f.product_id = n.product_id
+   AND f.severity   = n.severity
+ORDER BY delta DESC;
