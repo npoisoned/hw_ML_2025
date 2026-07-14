@@ -3,6 +3,10 @@
 vampy_to_gp_final.py
 Выгружает данные из Vampy API в Greenplum (КХД 2.0)
 Читает настройки из /home/akhvostovets/vampy-to-gp/.env
+
+Реальные эндпоинты Vampy:
+  Дефекты: POST /api/scan_issues/filter/?offset=0&limit=60
+  Продукты: GET /api/spaces/{SPACE_ID}/products/?limit=60&offset=0
 """
 
 import os
@@ -44,7 +48,9 @@ GP_DB       = os.environ["GP_DB"]
 GP_USER     = os.environ["GP_USER"]
 GP_PASSWORD = os.environ["GP_PASSWORD"]
 GP_SCHEMA   = os.environ.get("GP_SCHEMA", "custom_ts_secure_development")
+SPACE_ID    = os.environ.get("VAMPY_SPACE_ID", "")
 
+# Статусы которые НЕ учитываются в риске
 CLOSED_STATUSES = {"Fixed", "False Positive", "Exclusion"}
 
 # ============================================================
@@ -53,23 +59,33 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(message)s"
 )
 log = logging.getLogger("vampy-to-gp")
-HEADERS = {"Authentication": VAMPY_TOKEN, "Accept": "application/json"}
+HEADERS = {
+    "Authentication": VAMPY_TOKEN,
+    "Accept": "application/json",
+    "Content-Type": "application/json",
+}
 
 
+# ------------------------------------------------------------
+# Нормализация статуса
+# Реальные названия из API: new_issue, recurrent, confirmed,
+# risk_accepted, reopened, security-debt (с дефисом!),
+# fixed, false_positive, exclusion
+# ------------------------------------------------------------
 def normalize_status(raw: str) -> str:
     m = {
+        "new_issue":      "New",
         "new":            "New",
-        "recurrent":      "New",
+        "recurrent":      "New",          # объединяем с New
         "confirmed":      "Confirmed",
         "risk_accepted":  "Risk Accepted",
-        "risk accepted":  "Risk Accepted",
         "reopened":       "Reopened",
+        "security-debt":  "Security Debt", # с дефисом!
         "security_debt":  "Security Debt",
-        "security debt":  "Security Debt",
         "fixed":          "Fixed",
         "false_positive": "False Positive",
-        "false positive": "False Positive",
         "exclusion":      "Exclusion",
+        "check_required": "Check Required",
     }
     return m.get((raw or "").lower().strip(), raw or "")
 
@@ -88,39 +104,71 @@ def parse_dt(s) -> datetime | None:
         return None
 
 
+# ------------------------------------------------------------
+# Дефекты: POST /api/scan_issues/filter/
+# Постраничная выгрузка, только critical и high
+# ------------------------------------------------------------
 async def fetch_issues(session: aiohttp.ClientSession) -> list:
-    log.info("Запрашиваем дефекты /ext/v1/scan_issues/export/ ...")
-    async with session.get(
-        f"{VAMPY_URL}/ext/v1/scan_issues/export/",
-        headers=HEADERS,
-        params={
-            "payload":    "INLINE",
-            "formatter":  "JSON",
-            "severities": "critical,high",
-        },
-        timeout=aiohttp.ClientTimeout(total=300)
-    ) as r:
-        if r.status != 200:
-            text = await r.text()
-            raise Exception(f"Ошибка API {r.status}: {text[:300]}")
-        data = await r.json()
-    items = data.get("items", [])
-    log.info(f"Получено дефектов: {len(items)}")
-    return items
+    log.info("Запрашиваем дефекты POST /api/scan_issues/filter/ ...")
+    all_issues = []
+    offset = 0
+    limit  = 60
+
+    # Фильтр — только critical и high
+    body = {
+        "severities": ["CRITICAL", "HIGH"]
+    }
+
+    while True:
+        async with session.post(
+            f"{VAMPY_URL}/api/scan_issues/filter/",
+            headers=HEADERS,
+            params={
+                "offset": offset,
+                "limit":  limit,
+                "order":  "-severity,created,filePath"
+            },
+            json=body,
+            timeout=aiohttp.ClientTimeout(total=300)
+        ) as r:
+            if r.status != 200:
+                text = await r.text()
+                raise Exception(f"Ошибка API дефектов {r.status}: {text[:300]}")
+            data = await r.json()
+
+        items = data.get("items", [])
+        all_issues.extend(items)
+
+        # Проверяем есть ли ещё страницы
+        total    = data.get("totalCount", data.get("total", len(all_issues)))
+        has_next = len(all_issues) < total and len(items) == limit
+
+        log.info(f"Дефектов: {len(all_issues)} / {total}")
+
+        if not has_next or not items:
+            break
+        offset += limit
+
+    log.info(f"Итого дефектов получено: {len(all_issues)}")
+    return all_issues
 
 
+# ------------------------------------------------------------
+# Продукты: GET /api/spaces/{SPACE_ID}/products/
+# ------------------------------------------------------------
 async def fetch_products(session: aiohttp.ClientSession) -> list:
-    space_id = os.environ.get("VAMPY_SPACE_ID", "")
-    if not space_id:
+    if not SPACE_ID:
         log.warning("VAMPY_SPACE_ID не задан — продукты пропускаем")
         return []
-    log.info(f"Запрашиваем продукты /api/spaces/{space_id}/products/ ...")
+
+    log.info(f"Запрашиваем продукты /api/spaces/{SPACE_ID}/products/ ...")
     all_products = []
     offset = 0
     limit  = 60
+
     while True:
         async with session.get(
-            f"{VAMPY_URL}/api/spaces/{space_id}/products/",
+            f"{VAMPY_URL}/api/spaces/{SPACE_ID}/products/",
             headers=HEADERS,
             params={"limit": limit, "offset": offset},
             timeout=aiohttp.ClientTimeout(total=60)
@@ -130,30 +178,66 @@ async def fetch_products(session: aiohttp.ClientSession) -> list:
                 log.error(f"Ошибка продуктов {r.status}: {text[:200]}")
                 break
             data = await r.json()
+
         items    = data.get("items", [])
         has_next = data.get("hasNext", False)
         total    = data.get("totalCount", "?")
         all_products.extend(items)
+
         log.info(f"Продукты: {len(all_products)} / {total}")
+
         if not has_next or not items:
             break
         offset += limit
+
     return all_products
 
 
+# ------------------------------------------------------------
+# Подготовка строк дефектов для INSERT
+# Реальная структура:
+# {
+#   "id": "uuid",
+#   "status": "confirmed",
+#   "severity": "CRITICAL",
+#   "parser": "SBOM_CODE_SCORING",
+#   "repository": {"id": "...", "name": "...", "slug": "..."},
+#   "product": null или {"id": "...", "name": "..."},
+#   "sla": "2025-12-17",
+#   "completed": null,
+#   "created": "2025-12-10T09:36:48.722237Z"
+# }
+# ------------------------------------------------------------
 def prepare_issue_rows(items: list, snapshot_ts: datetime) -> list:
     rows = []
     for item in items:
-        status    = normalize_status(item.get("status", ""))
-        severity  = normalize_severity(item.get("severity", ""))
-        is_debt   = (status == "Security Debt")
+        status   = normalize_status(item.get("status", ""))
+        severity = normalize_severity(item.get("severity", ""))
+        is_debt  = (status == "Security Debt")
         is_active = (status not in CLOSED_STATUSES)
+
+        # repository — объект
+        repo = item.get("repository") or {}
+        if isinstance(repo, dict):
+            repo_name = repo.get("name", repo.get("slug", ""))
+        else:
+            repo_name = str(repo)
+
+        # product — может быть null
+        product = item.get("product") or {}
+        if isinstance(product, dict):
+            product_id   = str(product.get("id", ""))
+            product_name = product.get("name", product.get("slug", ""))
+        else:
+            product_id   = ""
+            product_name = ""
+
         rows.append((
             snapshot_ts,
             str(item.get("id", "")),
-            str(item.get("product", "") or ""),
-            str(item.get("product", "") or ""),
-            str(item.get("repository", "") or ""),
+            product_id,
+            product_name,
+            repo_name,
             severity,
             status,
             str(item.get("parser", "") or ""),
@@ -166,6 +250,9 @@ def prepare_issue_rows(items: list, snapshot_ts: datetime) -> list:
     return rows
 
 
+# ------------------------------------------------------------
+# Подготовка строк продуктов для INSERT
+# ------------------------------------------------------------
 def prepare_product_rows(products: list, snapshot_ts: datetime) -> list:
     rows = []
     for p in products:
@@ -178,6 +265,9 @@ def prepare_product_rows(products: list, snapshot_ts: datetime) -> list:
     return rows
 
 
+# ------------------------------------------------------------
+# Запись в Greenplum
+# ------------------------------------------------------------
 def save_to_greenplum(issue_rows: list, product_rows: list, snapshot_ts: datetime):
     dsn = (
         f"host={GP_HOST} port={GP_PORT} dbname={GP_DB} "
@@ -202,16 +292,6 @@ def save_to_greenplum(issue_rows: list, product_rows: list, snapshot_ts: datetim
                 ts, product_id, product_name, repos_count
             ) VALUES %s
         """, product_rows)
-
-    log.info("Обновляем названия продуктов...")
-    cur.execute(f"""
-        UPDATE {GP_SCHEMA}.issues_snapshot i
-        SET product_name = p.product_name
-        FROM {GP_SCHEMA}.products_snapshot p
-        WHERE i.product_id = p.product_id
-          AND i.ts = %s
-          AND p.ts = %s
-    """, (snapshot_ts, snapshot_ts))
 
     log.info("Обновляем дневные агрегаты...")
     today = snapshot_ts.date()
@@ -238,6 +318,9 @@ def save_to_greenplum(issue_rows: list, product_rows: list, snapshot_ts: datetim
     log.info("Greenplum обновлён.")
 
 
+# ------------------------------------------------------------
+# Главная функция
+# ------------------------------------------------------------
 async def main():
     snapshot_ts = datetime.now(timezone.utc)
     log.info(f"=== Старт: {snapshot_ts} ===")
