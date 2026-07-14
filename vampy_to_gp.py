@@ -4,9 +4,7 @@ vampy_to_gp_final.py
 Выгружает данные из Vampy API в Greenplum (КХД 2.0)
 Читает настройки из /home/akhvostovets/vampy-to-gp/.env
 
-Реальные эндпоинты Vampy:
-  Дефекты: POST /api/scan_issues/filter/?offset=0&limit=60
-  Продукты: GET /api/spaces/{SPACE_ID}/products/?limit=60&offset=0
+Статусы хранятся как есть из Vampy — маппинг в FineBI/views
 """
 
 import os
@@ -19,9 +17,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 
-# ============================================================
-# Загрузка .env файла
-# ============================================================
 def load_env(path: str = "/home/akhvostovets/vampy-to-gp/.env"):
     env_file = Path(path)
     if not env_file.exists():
@@ -37,9 +32,6 @@ def load_env(path: str = "/home/akhvostovets/vampy-to-gp/.env"):
 
 load_env()
 
-# ============================================================
-# НАСТРОЙКИ из .env
-# ============================================================
 VAMPY_URL   = os.environ["VAMPY_URL"]
 VAMPY_TOKEN = os.environ["VAMPY_TOKEN"]
 GP_HOST     = os.environ["GP_HOST"]
@@ -50,10 +42,19 @@ GP_PASSWORD = os.environ["GP_PASSWORD"]
 GP_SCHEMA   = os.environ.get("GP_SCHEMA", "custom_ts_secure_development")
 SPACE_ID    = os.environ.get("VAMPY_SPACE_ID", "")
 
-# Статусы которые НЕ учитываются в риске
-CLOSED_STATUSES = {"Fixed", "False Positive", "Exclusion"}
+# Закрытые статусы (для поля is_active)
+# Оригинальные названия из Vampy API
+CLOSED_STATUSES = {
+    "fixed",
+    "false_positive",
+    "exclusion",
+    "risk_accepted",
+    "security-debt",
+    "archive",
+    "not-applicable",
+    "wont-fix",
+}
 
-# ============================================================
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(message)s"
@@ -64,30 +65,6 @@ HEADERS = {
     "Accept": "application/json",
     "Content-Type": "application/json",
 }
-
-
-# ------------------------------------------------------------
-# Нормализация статуса
-# Реальные названия из API: new_issue, recurrent, confirmed,
-# risk_accepted, reopened, security-debt (с дефисом!),
-# fixed, false_positive, exclusion
-# ------------------------------------------------------------
-def normalize_status(raw: str) -> str:
-    m = {
-        "new_issue":      "New",
-        "new":            "New",
-        "recurrent":      "New",          # объединяем с New
-        "confirmed":      "Confirmed",
-        "risk_accepted":  "Risk Accepted",
-        "reopened":       "Reopened",
-        "security-debt":  "Security Debt", # с дефисом!
-        "security_debt":  "Security Debt",
-        "fixed":          "Fixed",
-        "false_positive": "False Positive",
-        "exclusion":      "Exclusion",
-        "check_required": "Check Required",
-    }
-    return m.get((raw or "").lower().strip(), raw or "")
 
 
 def normalize_severity(raw: str) -> str:
@@ -104,20 +81,13 @@ def parse_dt(s) -> datetime | None:
         return None
 
 
-# ------------------------------------------------------------
-# Дефекты: POST /api/scan_issues/filter/
-# Постраничная выгрузка, только critical и high
-# ------------------------------------------------------------
 async def fetch_issues(session: aiohttp.ClientSession) -> list:
     log.info("Запрашиваем дефекты POST /api/scan_issues/filter/ ...")
     all_issues = []
     offset = 0
     limit  = 60
 
-    # Фильтр — только critical и high
-    body = {
-        "severities": ["CRITICAL", "HIGH"]
-    }
+    body = {"severities": ["CRITICAL", "HIGH"]}
 
     while True:
         async with session.post(
@@ -133,13 +103,12 @@ async def fetch_issues(session: aiohttp.ClientSession) -> list:
         ) as r:
             if r.status != 200:
                 text = await r.text()
-                raise Exception(f"Ошибка API дефектов {r.status}: {text[:300]}")
+                raise Exception(f"Ошибка API {r.status}: {text[:300]}")
             data = await r.json()
 
         items = data.get("items", [])
         all_issues.extend(items)
 
-        # Проверяем есть ли ещё страницы
         total    = data.get("totalCount", data.get("total", len(all_issues)))
         has_next = len(all_issues) < total and len(items) == limit
 
@@ -149,13 +118,10 @@ async def fetch_issues(session: aiohttp.ClientSession) -> list:
             break
         offset += limit
 
-    log.info(f"Итого дефектов получено: {len(all_issues)}")
+    log.info(f"Итого дефектов: {len(all_issues)}")
     return all_issues
 
 
-# ------------------------------------------------------------
-# Продукты: GET /api/spaces/{SPACE_ID}/products/
-# ------------------------------------------------------------
 async def fetch_products(session: aiohttp.ClientSession) -> list:
     if not SPACE_ID:
         log.warning("VAMPY_SPACE_ID не задан — продукты пропускаем")
@@ -193,39 +159,26 @@ async def fetch_products(session: aiohttp.ClientSession) -> list:
     return all_products
 
 
-# ------------------------------------------------------------
-# Подготовка строк дефектов для INSERT
-# Реальная структура:
-# {
-#   "id": "uuid",
-#   "status": "confirmed",
-#   "severity": "CRITICAL",
-#   "parser": "SBOM_CODE_SCORING",
-#   "repository": {"id": "...", "name": "...", "slug": "..."},
-#   "product": null или {"id": "...", "name": "..."},
-#   "sla": "2025-12-17",
-#   "completed": null,
-#   "created": "2025-12-10T09:36:48.722237Z"
-# }
-# ------------------------------------------------------------
 def prepare_issue_rows(items: list, snapshot_ts: datetime) -> list:
     rows = []
     for item in items:
-        status   = normalize_status(item.get("status", ""))
-        severity = normalize_severity(item.get("severity", ""))
-        is_debt  = (status == "Security Debt")
-        is_active = (status not in CLOSED_STATUSES)
+        # Статус — храним как есть из Vampy
+        raw_status = (item.get("status") or "").lower().strip()
+        severity   = normalize_severity(item.get("severity", ""))
+
+        # is_security_debt — статус security-debt
+        is_debt   = (raw_status == "security-debt")
+
+        # is_active — открытый или закрытый
+        is_active = (raw_status not in CLOSED_STATUSES)
 
         # repository — объект
         repo = item.get("repository") or {}
-        if isinstance(repo, dict):
-            repo_name = repo.get("name", repo.get("slug", ""))
-        else:
-            repo_name = str(repo)
+        repo_name = repo.get("name", repo.get("slug", "")) if isinstance(repo, dict) else str(repo)
 
         # product — может быть null
         product = item.get("product") or {}
-        if isinstance(product, dict):
+        if isinstance(product, dict) and product:
             product_id   = str(product.get("id", ""))
             product_name = product.get("name", product.get("slug", ""))
         else:
@@ -239,7 +192,7 @@ def prepare_issue_rows(items: list, snapshot_ts: datetime) -> list:
             product_name,
             repo_name,
             severity,
-            status,
+            raw_status,              # оригинальный статус из Vampy
             str(item.get("parser", "") or ""),
             is_debt,
             is_active,
@@ -250,9 +203,6 @@ def prepare_issue_rows(items: list, snapshot_ts: datetime) -> list:
     return rows
 
 
-# ------------------------------------------------------------
-# Подготовка строк продуктов для INSERT
-# ------------------------------------------------------------
 def prepare_product_rows(products: list, snapshot_ts: datetime) -> list:
     rows = []
     for p in products:
@@ -265,9 +215,6 @@ def prepare_product_rows(products: list, snapshot_ts: datetime) -> list:
     return rows
 
 
-# ------------------------------------------------------------
-# Запись в Greenplum
-# ------------------------------------------------------------
 def save_to_greenplum(issue_rows: list, product_rows: list, snapshot_ts: datetime):
     dsn = (
         f"host={GP_HOST} port={GP_PORT} dbname={GP_DB} "
@@ -318,9 +265,6 @@ def save_to_greenplum(issue_rows: list, product_rows: list, snapshot_ts: datetim
     log.info("Greenplum обновлён.")
 
 
-# ------------------------------------------------------------
-# Главная функция
-# ------------------------------------------------------------
 async def main():
     snapshot_ts = datetime.now(timezone.utc)
     log.info(f"=== Старт: {snapshot_ts} ===")
