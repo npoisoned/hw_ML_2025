@@ -1,4 +1,10 @@
 #!/usr/bin/env python3
+"""
+vampy_to_gp_final.py
+Выгружает данные из Vampy API в Greenplum (КХД 2.0)
+Читает настройки из /home/akhvostovets/vampy-to-gp/.env
+"""
+
 import os
 import logging
 import asyncio
@@ -104,17 +110,25 @@ async def fetch_issues(session: aiohttp.ClientSession) -> list:
 
 
 async def fetch_products(session: aiohttp.ClientSession) -> list:
-    log.info("Запрашиваем продукты /ext/v1/products/ ...")
+    space_id = os.environ.get("VAMPY_SPACE_ID", "")
+    if not space_id:
+        log.warning("VAMPY_SPACE_ID не задан — продукты пропускаем")
+        return []
+    log.info(f"Запрашиваем продукты /api/spaces/{space_id}/products/ ...")
     all_products = []
     offset = 0
-    limit  = 50
+    limit  = 60
     while True:
         async with session.get(
-            f"{VAMPY_URL}/ext/v1/products/",
+            f"{VAMPY_URL}/api/spaces/{space_id}/products/",
             headers=HEADERS,
             params={"limit": limit, "offset": offset},
             timeout=aiohttp.ClientTimeout(total=60)
         ) as r:
+            if r.status != 200:
+                text = await r.text()
+                log.error(f"Ошибка продуктов {r.status}: {text[:200]}")
+                break
             data = await r.json()
         items    = data.get("items", [])
         has_next = data.get("hasNext", False)
