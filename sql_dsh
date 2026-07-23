@@ -1,36 +1,31 @@
-SET search_path TO custom_ts_secure_development;
+-- ============================================================
+-- Таблицы для дашборда AppSec
+-- Схема явно указана в каждом запросе
+-- ============================================================
 
+-- Таблица 1: основные дефекты
+DROP TABLE IF EXISTS custom_ts_secure_development.issues_snapshot CASCADE;
 
--- ------------------------------------------------------------
--- 1. Основная таблица дефектов
--- Сюда попадают только Critical и High из Vampy
--- ------------------------------------------------------------
-DROP TABLE IF EXISTS issues_snapshot CASCADE;
-
-CREATE TABLE issues_snapshot (
+CREATE TABLE custom_ts_secure_development.issues_snapshot (
     ts               TIMESTAMP,
     issue_id         TEXT,
     product_id       TEXT,
     product_name     TEXT,
     repository       TEXT,
-    severity         TEXT,        -- CRITICAL / HIGH
-    status           TEXT,        -- New / Confirmed / Risk Accepted / Reopened /
-                                  -- Security Debt / Fixed / False Positive / Exclusion
-    scanner          TEXT,        -- SEMGREP / GRYPE / DAST и тд
-    is_security_debt BOOLEAN,     -- TRUE если Security Debt трек
-    is_active        BOOLEAN,     -- TRUE если открытый (не Fixed/FP/Exclusion)
+    severity         TEXT,
+    status           TEXT,
+    scanner          TEXT,
+    is_security_debt BOOLEAN,
+    is_active        BOOLEAN,
     created_at       TIMESTAMP,
-    updated_at       TIMESTAMP,   -- дата изменения статуса (completed из Vampy)
-    ra_deadline      TIMESTAMP    -- дедлайн Risk Accepted (sla из Vampy)
+    updated_at       TIMESTAMP,
+    ra_deadline      TIMESTAMP
 ) DISTRIBUTED BY (issue_id);
 
+-- Таблица 2: дневные агрегаты
+DROP TABLE IF EXISTS custom_ts_secure_development.issues_daily CASCADE;
 
--- ------------------------------------------------------------
--- 2. Дневные агрегаты (для графиков динамики в FineBI)
--- ------------------------------------------------------------
-DROP TABLE IF EXISTS issues_daily CASCADE;
-
-CREATE TABLE issues_daily (
+CREATE TABLE custom_ts_secure_development.issues_daily (
     dt               DATE,
     product_id       TEXT,
     product_name     TEXT,
@@ -41,31 +36,20 @@ CREATE TABLE issues_daily (
     cnt              INTEGER
 ) DISTRIBUTED BY (product_id);
 
+-- Таблица 3: продукты
+DROP TABLE IF EXISTS custom_ts_secure_development.products_snapshot CASCADE;
 
--- ------------------------------------------------------------
--- 3. Продукты из Vampy
--- ------------------------------------------------------------
-DROP TABLE IF EXISTS products_snapshot CASCADE;
-
-CREATE TABLE products_snapshot (
+CREATE TABLE custom_ts_secure_development.products_snapshot (
     ts           TIMESTAMP,
     product_id   TEXT,
     product_name TEXT,
     repos_count  INTEGER
 ) DISTRIBUTED BY (product_id);
 
+-- View 1: красная зона
+DROP VIEW IF EXISTS custom_ts_secure_development.red_zone;
 
--- ============================================================
--- VIEWS для FineBI
--- Все views работают только с Critical и High
--- ============================================================
-
--- ------------------------------------------------------------
--- 4. Красная зона — просроченные дедлайны прямо сейчас
--- ------------------------------------------------------------
-DROP VIEW IF EXISTS red_zone;
-
-CREATE VIEW red_zone AS
+CREATE VIEW custom_ts_secure_development.red_zone AS
 SELECT
     issue_id,
     product_name,
@@ -76,94 +60,71 @@ SELECT
     created_at,
     ra_deadline,
     EXTRACT(DAY FROM NOW() - ra_deadline)::INTEGER AS days_overdue
-FROM issues_snapshot
+FROM custom_ts_secure_development.issues_snapshot
 WHERE
-    ts = (SELECT MAX(ts) FROM issues_snapshot)
+    ts = (SELECT MAX(ts) FROM custom_ts_secure_development.issues_snapshot)
     AND severity IN ('CRITICAL', 'HIGH')
     AND (
-        -- Risk Accepted Critical просрочен > 14 дней
         (status = 'Risk Accepted' AND severity = 'CRITICAL'
             AND ra_deadline IS NOT NULL AND ra_deadline < NOW())
         OR
-        -- Risk Accepted High просрочен > 60 дней
         (status = 'Risk Accepted' AND severity = 'HIGH'
             AND ra_deadline IS NOT NULL AND ra_deadline < NOW())
         OR
-        -- Confirmed Critical — всегда красная зона
         (status = 'Confirmed' AND severity = 'CRITICAL')
         OR
-        -- Confirmed High просрочен > 60 дней
         (status = 'Confirmed' AND severity = 'HIGH'
             AND updated_at < NOW() - INTERVAL '60 days')
         OR
-        -- Security Debt после 01.01.2027
-        (is_security_debt = TRUE
-            AND is_active = TRUE
+        (is_security_debt = TRUE AND is_active = TRUE
             AND NOW() > TIMESTAMP '2027-01-01 00:00:00')
         OR
-        -- Reopened Critical/High — всегда в красной зоне
         (status = 'Reopened' AND severity IN ('CRITICAL', 'HIGH'))
     )
 ORDER BY
     CASE severity WHEN 'CRITICAL' THEN 1 WHEN 'HIGH' THEN 2 END,
     days_overdue DESC NULLS LAST;
 
+-- View 2: сводка по продуктам
+DROP VIEW IF EXISTS custom_ts_secure_development.products_current;
 
--- ------------------------------------------------------------
--- 5. Сводка по продуктам
--- ------------------------------------------------------------
-DROP VIEW IF EXISTS products_current;
-
-CREATE VIEW products_current AS
+CREATE VIEW custom_ts_secure_development.products_current AS
 SELECT
     product_id,
     product_name,
     COUNT(DISTINCT repository)                                           AS repos_count,
-    -- Critical открытых (не Security Debt)
     COUNT(CASE WHEN severity = 'CRITICAL'
                AND is_active = TRUE
                AND is_security_debt = FALSE THEN 1 END)                 AS critical_open,
-    -- High открытых (не Security Debt)
     COUNT(CASE WHEN severity = 'HIGH'
                AND is_active = TRUE
                AND is_security_debt = FALSE THEN 1 END)                 AS high_open,
-    -- Reopened Critical+High
     COUNT(CASE WHEN status = 'Reopened' THEN 1 END)                     AS reopened_total,
-    -- Security Debt остаток
     COUNT(CASE WHEN is_security_debt = TRUE
                AND is_active = TRUE THEN 1 END)                         AS security_debt_total,
-    -- Security Debt Critical
     COUNT(CASE WHEN is_security_debt = TRUE
                AND is_active = TRUE
                AND severity = 'CRITICAL' THEN 1 END)                    AS security_debt_critical,
-    -- Security Debt High
     COUNT(CASE WHEN is_security_debt = TRUE
                AND is_active = TRUE
                AND severity = 'HIGH' THEN 1 END)                        AS security_debt_high,
-    -- Risk Accepted просроченные
     COUNT(CASE WHEN status = 'Risk Accepted'
                AND ra_deadline IS NOT NULL
                AND ra_deadline < NOW() THEN 1 END)                      AS ra_overdue,
-    -- Confirmed Critical — блокируют релиз
     COUNT(CASE WHEN status = 'Confirmed'
                AND severity = 'CRITICAL' THEN 1 END)                    AS confirmed_critical,
-    -- Fixed за 30 дней
     COUNT(CASE WHEN status = 'Fixed'
                AND updated_at >= NOW() - INTERVAL '30 days' THEN 1 END) AS fixed_30d,
-    -- Exclusion (для информации)
     COUNT(CASE WHEN status = 'Exclusion' THEN 1 END)                    AS exclusions
-FROM issues_snapshot
-WHERE ts = (SELECT MAX(ts) FROM issues_snapshot)
+FROM custom_ts_secure_development.issues_snapshot
+WHERE ts = (SELECT MAX(ts) FROM custom_ts_secure_development.issues_snapshot)
 GROUP BY product_id, product_name
 ORDER BY critical_open DESC;
 
+-- View 3: MTTR по продуктам
+DROP VIEW IF EXISTS custom_ts_secure_development.mttr_by_product;
 
--- ------------------------------------------------------------
--- 6. MTTR по продуктам (медиана дней от обнаружения до Fixed)
--- ------------------------------------------------------------
-DROP VIEW IF EXISTS mttr_by_product;
-
-CREATE VIEW mttr_by_product AS
+CREATE VIEW custom_ts_secure_development.mttr_by_product AS
 SELECT
     product_id,
     product_name,
@@ -171,8 +132,8 @@ SELECT
     PERCENTILE_CONT(0.5) WITHIN GROUP (
         ORDER BY EXTRACT(DAY FROM updated_at - created_at)
     )::INTEGER AS mttr_days,
-    COUNT(*)   AS fixed_count
-FROM issues_snapshot
+    COUNT(*) AS fixed_count
+FROM custom_ts_secure_development.issues_snapshot
 WHERE
     status = 'Fixed'
     AND updated_at >= NOW() - INTERVAL '30 days'
@@ -182,53 +143,45 @@ WHERE
 GROUP BY product_id, product_name, severity
 ORDER BY mttr_days ASC;
 
+-- View 4: Security Debt прогресс
+DROP VIEW IF EXISTS custom_ts_secure_development.security_debt_progress;
 
--- ------------------------------------------------------------
--- 7. Security Debt прогресс и прогноз к концу года
--- ------------------------------------------------------------
-DROP VIEW IF EXISTS security_debt_progress;
-
-CREATE VIEW security_debt_progress AS
+CREATE VIEW custom_ts_secure_development.security_debt_progress AS
 SELECT
     product_id,
     product_name,
     COUNT(CASE WHEN severity = 'CRITICAL'
-               AND is_active = TRUE THEN 1 END)                      AS debt_critical_open,
+               AND is_active = TRUE THEN 1 END)                         AS debt_critical_open,
     COUNT(CASE WHEN severity = 'HIGH'
-               AND is_active = TRUE THEN 1 END)                      AS debt_high_open,
+               AND is_active = TRUE THEN 1 END)                         AS debt_high_open,
     COUNT(CASE WHEN status = 'Fixed'
                AND updated_at >= NOW() - INTERVAL '30 days' THEN 1 END) AS fixed_last_30d,
     EXTRACT(DAY FROM TIMESTAMP '2027-01-01 00:00:00' - NOW())::INTEGER  AS days_to_deadline
-FROM issues_snapshot
+FROM custom_ts_secure_development.issues_snapshot
 WHERE
-    ts = (SELECT MAX(ts) FROM issues_snapshot)
+    ts = (SELECT MAX(ts) FROM custom_ts_secure_development.issues_snapshot)
     AND is_security_debt = TRUE
 GROUP BY product_id, product_name
 ORDER BY debt_critical_open DESC;
 
+-- View 5: эффективность устранения
+DROP VIEW IF EXISTS custom_ts_secure_development.effectiveness_by_product;
 
--- ------------------------------------------------------------
--- 8. Эффективность устранения
--- Показывает: закрыли дефекты — а риск вырос или снизился?
--- delta > 0 = риск вырос, delta < 0 = риск снизился
--- ------------------------------------------------------------
-DROP VIEW IF EXISTS effectiveness_by_product;
-
-CREATE VIEW effectiveness_by_product AS
+CREATE VIEW custom_ts_secure_development.effectiveness_by_product AS
 WITH
 fixed_30d AS (
     SELECT product_id, product_name, severity, COUNT(*) AS cnt
-    FROM issues_snapshot
+    FROM custom_ts_secure_development.issues_snapshot
     WHERE status = 'Fixed'
       AND updated_at >= NOW() - INTERVAL '30 days'
     GROUP BY product_id, product_name, severity
 ),
 new_30d AS (
     SELECT product_id, product_name, severity, COUNT(*) AS cnt
-    FROM issues_snapshot
+    FROM custom_ts_secure_development.issues_snapshot
     WHERE status IN ('New', 'Reopened', 'Confirmed')
       AND created_at >= NOW() - INTERVAL '30 days'
-      AND ts = (SELECT MAX(ts) FROM issues_snapshot)
+      AND ts = (SELECT MAX(ts) FROM custom_ts_secure_development.issues_snapshot)
     GROUP BY product_id, product_name, severity
 )
 SELECT
@@ -243,3 +196,307 @@ FULL OUTER JOIN new_30d n
     ON f.product_id = n.product_id
    AND f.severity   = n.severity
 ORDER BY delta DESC;
+-- ============================================================
+-- Дополнительные views и таблицы для FineBI
+-- Схема: custom_ts_secure_development
+-- Запускать в dBeaver после greenplum_tables_v4.sql
+-- ============================================================
+
+
+-- ------------------------------------------------------------
+-- 1. issues_current
+-- Одна строка = один актуальный дефект из последнего снапшота
+-- Это главный источник для KPI карточек в FineBI
+-- ------------------------------------------------------------
+DROP VIEW IF EXISTS custom_ts_secure_development.issues_current;
+
+CREATE VIEW custom_ts_secure_development.issues_current AS
+WITH last_snapshot AS (
+    -- Берём только последний снапшот
+    SELECT MAX(ts) AS max_ts
+    FROM custom_ts_secure_development.issues_snapshot
+),
+ranked AS (
+    SELECT
+        i.*,
+        -- Флаги для FineBI (SUM вместо COUNT DISTINCT)
+        1                                               AS issue_cnt,
+        CASE WHEN i.is_active THEN 1 ELSE 0 END        AS is_active_int,
+        -- Красная зона
+        CASE WHEN (
+            (i.status = 'risk_accepted' AND i.severity = 'CRITICAL'
+                AND i.ra_deadline IS NOT NULL AND i.ra_deadline < NOW())
+            OR
+            (i.status = 'risk_accepted' AND i.severity = 'HIGH'
+                AND i.ra_deadline IS NOT NULL AND i.ra_deadline < NOW())
+            OR
+            (i.status = 'confirmed' AND i.severity = 'CRITICAL')
+            OR
+            (i.status = 'confirmed' AND i.severity = 'HIGH'
+                AND i.updated_at < NOW() - INTERVAL '60 days')
+            OR
+            (i.is_security_debt AND i.is_active
+                AND NOW() > TIMESTAMP '2027-01-01 00:00:00')
+            OR
+            (i.status = 'reopened' AND i.severity IN ('CRITICAL','HIGH'))
+        ) THEN 1 ELSE 0 END                             AS is_red_zone_int,
+        -- Блокирует релиз
+        CASE WHEN (
+            (i.status = 'confirmed' AND i.severity = 'CRITICAL')
+            OR
+            (i.status = 'confirmed' AND i.severity = 'HIGH'
+                AND i.updated_at < NOW() - INTERVAL '60 days')
+            OR
+            (i.is_security_debt AND i.is_active
+                AND NOW() > TIMESTAMP '2027-01-01 00:00:00')
+        ) THEN 1 ELSE 0 END                             AS is_release_blocking_int,
+        -- Risk Accepted просрочен
+        CASE WHEN (
+            i.status = 'risk_accepted'
+            AND i.ra_deadline IS NOT NULL
+            AND i.ra_deadline < NOW()
+        ) THEN 1 ELSE 0 END                             AS is_ra_overdue_int,
+        -- Fixed за последние 30 дней
+        CASE WHEN (
+            i.status = 'fixed'
+            AND i.updated_at >= NOW() - INTERVAL '30 days'
+        ) THEN 1 ELSE 0 END                             AS is_fixed_30d_int,
+        -- Дней открыт
+        EXTRACT(DAY FROM NOW() - i.created_at)::INTEGER AS days_open,
+        -- Дней просрочен (для RA)
+        CASE WHEN i.ra_deadline IS NOT NULL AND i.ra_deadline < NOW()
+            THEN EXTRACT(DAY FROM NOW() - i.ra_deadline)::INTEGER
+            ELSE 0
+        END                                             AS days_overdue,
+        -- Читаемый статус для FineBI
+        CASE i.status
+            WHEN 'new_issue'      THEN 'New'
+            WHEN 'recurrent'      THEN 'New'
+            WHEN 'confirmed'      THEN 'Confirmed'
+            WHEN 'risk_accepted'  THEN 'Risk Accepted'
+            WHEN 'reopened'       THEN 'Reopened'
+            WHEN 'security-debt'  THEN 'Security Debt'
+            WHEN 'fixed'          THEN 'Fixed'
+            WHEN 'false_positive' THEN 'False Positive'
+            WHEN 'exclusion'      THEN 'Exclusion'
+            ELSE i.status
+        END                                             AS status_display,
+        -- Приоритет для сортировки в детальной таблице
+        CASE
+            WHEN i.status = 'confirmed' AND i.severity = 'CRITICAL' THEN 1
+            WHEN i.status = 'reopened'  AND i.severity = 'CRITICAL' THEN 2
+            WHEN i.status = 'risk_accepted' AND i.severity = 'CRITICAL'
+                AND i.ra_deadline < NOW()               THEN 3
+            WHEN i.severity = 'CRITICAL'                THEN 4
+            WHEN i.status = 'confirmed' AND i.severity = 'HIGH'     THEN 5
+            WHEN i.status = 'reopened'  AND i.severity = 'HIGH'     THEN 6
+            WHEN i.status = 'risk_accepted' AND i.severity = 'HIGH'
+                AND i.ra_deadline < NOW()               THEN 7
+            WHEN i.severity = 'HIGH'                    THEN 8
+            ELSE 99
+        END                                             AS priority_order
+    FROM custom_ts_secure_development.issues_snapshot i
+    CROSS JOIN last_snapshot l
+    WHERE i.ts = l.max_ts
+)
+SELECT * FROM ranked;
+
+
+-- ------------------------------------------------------------
+-- 2. dim_product
+-- Справочник продуктов — одна строка на продукт
+-- Нужен для связей в FineBI Subject Model
+-- ------------------------------------------------------------
+DROP VIEW IF EXISTS custom_ts_secure_development.dim_product;
+
+CREATE VIEW custom_ts_secure_development.dim_product AS
+SELECT
+    product_id,
+    product_name,
+    repos_count
+FROM custom_ts_secure_development.products_snapshot
+WHERE ts = (SELECT MAX(ts) FROM custom_ts_secure_development.products_snapshot);
+
+
+-- ------------------------------------------------------------
+-- 3. appsec_summary
+-- Одна строка с общими KPI — самый быстрый источник для карточек
+-- FineBI просто читает готовые цифры
+-- ------------------------------------------------------------
+DROP VIEW IF EXISTS custom_ts_secure_development.appsec_summary;
+
+CREATE VIEW custom_ts_secure_development.appsec_summary AS
+SELECT
+    -- Открытые дефекты
+    COUNT(CASE WHEN is_active_int = 1 AND is_security_debt = FALSE THEN 1 END)
+        AS total_open,
+    COUNT(CASE WHEN is_active_int = 1 AND severity = 'CRITICAL'
+               AND is_security_debt = FALSE THEN 1 END)
+        AS open_critical,
+    COUNT(CASE WHEN is_active_int = 1 AND severity = 'HIGH'
+               AND is_security_debt = FALSE THEN 1 END)
+        AS open_high,
+    -- Красная зона
+    COUNT(CASE WHEN is_red_zone_int = 1 THEN 1 END)
+        AS red_zone_total,
+    -- Блокируют релиз
+    COUNT(CASE WHEN is_release_blocking_int = 1 THEN 1 END)
+        AS release_blockers,
+    -- Risk Accepted просроченных
+    COUNT(CASE WHEN is_ra_overdue_int = 1 THEN 1 END)
+        AS ra_overdue,
+    -- Fixed за 30 дней
+    COUNT(CASE WHEN is_fixed_30d_int = 1 THEN 1 END)
+        AS fixed_30d,
+    -- Security Debt
+    COUNT(CASE WHEN is_security_debt AND is_active_int = 1 THEN 1 END)
+        AS security_debt_total,
+    COUNT(CASE WHEN is_security_debt AND is_active_int = 1
+               AND severity = 'CRITICAL' THEN 1 END)
+        AS security_debt_critical,
+    COUNT(CASE WHEN is_security_debt AND is_active_int = 1
+               AND severity = 'HIGH' THEN 1 END)
+        AS security_debt_high,
+    -- Дней до дедлайна Security Debt
+    EXTRACT(DAY FROM TIMESTAMP '2027-01-01 00:00:00' - NOW())::INTEGER
+        AS days_to_deadline,
+    -- Текущее время снапшота
+    NOW()::DATE AS snapshot_date
+FROM custom_ts_secure_development.issues_current;
+
+
+-- ------------------------------------------------------------
+-- 4. security_debt_forecast
+-- Прогноз погашения Security Debt
+-- Нужен для графика с прогнозной линией в FineBI
+-- ------------------------------------------------------------
+DROP VIEW IF EXISTS custom_ts_secure_development.security_debt_forecast;
+
+CREATE VIEW custom_ts_secure_development.security_debt_forecast AS
+WITH
+-- Текущий остаток
+current_debt AS (
+    SELECT
+        COUNT(CASE WHEN is_active_int = 1 THEN 1 END) AS remaining,
+        COUNT(CASE WHEN is_fixed_30d_int = 1 THEN 1 END) AS fixed_30d
+    FROM custom_ts_secure_development.issues_current
+    WHERE is_security_debt = TRUE
+),
+-- Темп закрытия в день
+velocity AS (
+    SELECT
+        CASE WHEN fixed_30d > 0
+            THEN fixed_30d / 30.0
+            ELSE 0
+        END AS daily_velocity
+    FROM current_debt
+)
+SELECT
+    NOW()::DATE                                         AS calc_date,
+    c.remaining                                         AS current_remaining,
+    c.fixed_30d                                         AS fixed_last_30d,
+    v.daily_velocity                                    AS daily_velocity,
+    -- Дней до полного погашения при текущем темпе
+    CASE WHEN v.daily_velocity > 0
+        THEN (c.remaining / v.daily_velocity)::INTEGER
+        ELSE NULL
+    END                                                 AS days_to_zero,
+    -- Остаток на 01.01.2027 при текущем темпе
+    GREATEST(0,
+        c.remaining - (
+            v.daily_velocity *
+            EXTRACT(DAY FROM TIMESTAMP '2027-01-01' - NOW())
+        )
+    )::INTEGER                                          AS forecast_remaining_at_deadline,
+    -- Успеваем или нет
+    CASE WHEN v.daily_velocity > 0
+         AND (c.remaining / v.daily_velocity) <=
+             EXTRACT(DAY FROM TIMESTAMP '2027-01-01' - NOW())
+        THEN 'ON TRACK'
+        ELSE 'AT RISK'
+    END                                                 AS forecast_status,
+    EXTRACT(DAY FROM TIMESTAMP '2027-01-01 00:00:00' - NOW())::INTEGER
+        AS days_to_deadline
+FROM current_debt c, velocity v;
+
+
+-- ------------------------------------------------------------
+-- 5. products_full
+-- Расширенная сводка по продуктам для сравнительной таблицы
+-- Одна строка = один продукт, все KPI готовы
+-- ------------------------------------------------------------
+DROP VIEW IF EXISTS custom_ts_secure_development.products_full;
+
+CREATE VIEW custom_ts_secure_development.products_full AS
+WITH
+current_stats AS (
+    SELECT
+        product_id,
+        product_name,
+        COUNT(DISTINCT repository)                                          AS repos_count,
+        -- Текущие открытые (не Security Debt)
+        SUM(CASE WHEN is_active_int = 1 AND severity = 'CRITICAL'
+                 AND is_security_debt = FALSE THEN 1 ELSE 0 END)            AS open_critical,
+        SUM(CASE WHEN is_active_int = 1 AND severity = 'HIGH'
+                 AND is_security_debt = FALSE THEN 1 ELSE 0 END)            AS open_high,
+        -- Красная зона и блокировки
+        SUM(is_red_zone_int)                                                AS red_zone_count,
+        SUM(is_release_blocking_int)                                        AS release_blockers,
+        SUM(is_ra_overdue_int)                                              AS overdue_ra,
+        -- Security Debt
+        SUM(CASE WHEN is_security_debt AND is_active_int = 1
+                 THEN 1 ELSE 0 END)                                         AS security_debt_total,
+        SUM(CASE WHEN is_security_debt AND is_active_int = 1
+                 AND severity = 'CRITICAL' THEN 1 ELSE 0 END)               AS security_debt_critical,
+        SUM(CASE WHEN is_security_debt AND is_active_int = 1
+                 AND severity = 'HIGH' THEN 1 ELSE 0 END)                   AS security_debt_high,
+        -- Fixed и Reopened
+        SUM(is_fixed_30d_int)                                               AS fixed_30d,
+        SUM(CASE WHEN status = 'reopened'
+                 AND severity IN ('CRITICAL','HIGH') THEN 1 ELSE 0 END)     AS reopened_ch,
+        -- Exclusions
+        SUM(CASE WHEN status = 'exclusion' THEN 1 ELSE 0 END)              AS exclusions
+    FROM custom_ts_secure_development.issues_current
+    GROUP BY product_id, product_name
+),
+mttr AS (
+    SELECT product_id, mttr_days
+    FROM custom_ts_secure_development.mttr_by_product
+    WHERE severity = 'CRITICAL'   -- берём MTTR по Critical
+)
+SELECT
+    s.*,
+    m.mttr_days,
+    -- Флаг красной зоны для условного форматирования в FineBI
+    CASE WHEN s.red_zone_count > 0 OR s.release_blockers > 0
+        THEN 1 ELSE 0 END AS has_red_zone
+FROM current_stats s
+LEFT JOIN mttr m ON s.product_id = m.product_id
+ORDER BY s.open_critical DESC, s.open_high DESC;
+
+
+-- ============================================================
+-- ПРОВЕРОЧНЫЕ ЗАПРОСЫ
+-- ============================================================
+
+-- Общие KPI (одна строка):
+-- SELECT * FROM custom_ts_secure_development.appsec_summary;
+
+-- Текущие дефекты (первые 10):
+-- SELECT issue_id, product_name, severity, status_display,
+--        is_red_zone_int, is_release_blocking_int, priority_order
+-- FROM custom_ts_secure_development.issues_current
+-- ORDER BY priority_order
+-- LIMIT 10;
+
+-- Прогноз Security Debt:
+-- SELECT * FROM custom_ts_secure_development.security_debt_forecast;
+
+-- Сводка по продуктам:
+-- SELECT product_name, open_critical, open_high, red_zone_count,
+--        release_blockers, mttr_days
+-- FROM custom_ts_secure_development.products_full
+-- LIMIT 10;
+
+-- Справочник продуктов:
+-- SELECT * FROM custom_ts_secure_development.dim_product LIMIT 5;
