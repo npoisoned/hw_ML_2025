@@ -87,7 +87,10 @@ async def fetch_issues(session: aiohttp.ClientSession) -> list:
     offset = 0
     limit  = 60
 
-    body = {"severities": ["CRITICAL", "HIGH"]}
+    body = {
+        "severities": ["CRITICAL", "HIGH"],
+        "defaultRelations": True   # только дефолтные ветки
+    }
 
     while True:
         async with session.post(
