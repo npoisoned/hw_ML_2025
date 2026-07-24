@@ -1,292 +1,416 @@
-#!/usr/bin/env python3
-"""
-vampy_to_gp_final.py
-Выгружает данные из Vampy API в Greenplum (КХД 2.0)
-Читает настройки из /home/akhvostovets/vampy-to-gp/.env
+По логу сам запуск завершился нормально:
 
-Статусы хранятся как есть из Vampy — маппинг в FineBI/views
-"""
+```text
+issues = 33 027
+дубли = 0
+без repository_id = 0
+репозиториев = 907
+рабочих связей = 799
+mapped repositories = 729
+unmapped repositories = 178
+events = 266
+```
 
-import os
-import logging
-import asyncio
-import aiohttp
-import psycopg2
-from psycopg2.extras import execute_values
-from datetime import datetime, timezone
-from pathlib import Path
+Главное сейчас — понять, **сколько дефектов сидит в 178 непривязанных репозиториях**, и проверить количество продуктов: API сейчас вернул уже **40**, а не 39.
 
+Все запросы ниже только читают данные.
 
-def load_env(path: str = "/home/akhvostovets/vampy-to-gp/.env"):
-    env_file = Path(path)
-    if not env_file.exists():
-        raise FileNotFoundError(f".env файл не найден: {path}")
-    with open(env_file) as f:
-        for line in f:
-            line = line.strip()
-            if not line or line.startswith("#") or "=" not in line:
-                continue
-            key, _, value = line.partition("=")
-            os.environ.setdefault(key.strip(), value.strip())
+## 1. Последний снапшот: все ли 33 027 строк записались
 
-
-load_env()
-
-VAMPY_URL   = os.environ["VAMPY_URL"]
-VAMPY_TOKEN = os.environ["VAMPY_TOKEN"]
-GP_HOST     = os.environ["GP_HOST"]
-GP_PORT     = os.environ.get("GP_PORT", "5050")
-GP_DB       = os.environ["GP_DB"]
-GP_USER     = os.environ["GP_USER"]
-GP_PASSWORD = os.environ["GP_PASSWORD"]
-GP_SCHEMA   = os.environ.get("GP_SCHEMA", "custom_ts_secure_development")
-SPACE_ID    = os.environ.get("VAMPY_SPACE_ID", "")
-
-# Закрытые статусы (для поля is_active)
-# Оригинальные названия из Vampy API
-CLOSED_STATUSES = {
-    "fixed",
-    "false_positive",
-    "exclusion",
-    "risk_accepted",
-    "security-debt",
-    "archive",
-    "not-applicable",
-    "wont-fix",
-}
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(message)s"
+```sql
+WITH latest AS (
+    SELECT MAX(ts) AS max_ts
+    FROM custom_ts_secure_development.issues_snapshot
 )
-log = logging.getLogger("vampy-to-gp")
-HEADERS = {
-    "Authentication": VAMPY_TOKEN,
-    "Accept": "application/json",
-    "Content-Type": "application/json",
-}
+SELECT
+    l.max_ts AS snapshot_ts,
+    COUNT(*) AS snapshot_rows,
+    COUNT(DISTINCT i.issue_id) AS unique_issues,
+    COUNT(*) - COUNT(DISTINCT i.issue_id) AS duplicate_rows,
+    COUNT(DISTINCT i.repository_id) AS repositories
+FROM custom_ts_secure_development.issues_snapshot i
+CROSS JOIN latest l
+WHERE i.ts = l.max_ts
+GROUP BY l.max_ts;
+```
 
+Ожидаем:
 
-def normalize_severity(raw: str) -> str:
-    m = {"critical": "CRITICAL", "high": "HIGH"}
-    return m.get((raw or "").lower(), (raw or "").upper())
+```text
+snapshot_rows    = 33027
+unique_issues    = 33027
+duplicate_rows   = 0
+repositories     = 907
+```
 
+## 2. Свежесть загрузки
 
-def parse_dt(s) -> datetime | None:
-    if not s:
-        return None
-    try:
-        return datetime.fromisoformat(str(s).replace("Z", "+00:00"))
-    except Exception:
-        return None
+```sql
+SELECT *
+FROM custom_ts_secure_development.data_freshness;
+```
 
+Сейчас должно быть:
 
-async def fetch_issues(session: aiohttp.ClientSession) -> list:
-    log.info("Запрашиваем дефекты POST /api/scan_issues/filter/ ...")
-    all_issues = []
-    offset = 0
-    limit  = 60
+```text
+freshness_status = OK
+```
 
-    body = {
-        "severities": ["CRITICAL", "HIGH"],
-        "defaultRelations": True   # только дефолтные ветки
-    }
+## 3. Проверка количества продуктов
 
-    while True:
-        async with session.post(
-            f"{VAMPY_URL}/api/scan_issues/filter/",
-            headers=HEADERS,
-            params={
-                "offset": offset,
-                "limit":  limit,
-                "order":  "-severity,created,filePath"
-            },
-            json=body,
-            timeout=aiohttp.ClientTimeout(total=300)
-        ) as r:
-            if r.status != 200:
-                text = await r.text()
-                raise Exception(f"Ошибка API {r.status}: {text[:300]}")
-            data = await r.json()
+```sql
+WITH latest AS (
+    SELECT MAX(ts) AS max_ts
+    FROM custom_ts_secure_development.products_snapshot
+)
+SELECT
+    COUNT(*) AS raw_product_rows,
+    COUNT(DISTINCT p.product_id) AS raw_unique_products,
+    (
+        SELECT COUNT(*)
+        FROM custom_ts_secure_development.dim_product
+    ) AS dashboard_products
+FROM custom_ts_secure_development.products_snapshot p
+CROSS JOIN latest l
+WHERE p.ts = l.max_ts;
+```
 
-        items = data.get("items", [])
-        all_issues.extend(items)
+По логу ожидаем:
 
-        total    = data.get("totalCount", data.get("total", len(all_issues)))
-        has_next = len(all_issues) < total and len(items) == limit
+```text
+raw_unique_products = 40
+dashboard_products   = 38
+```
 
-        log.info(f"Дефектов: {len(all_issues)} / {total}")
+Почему 38: из 40 исключаются `TEST` и `Default product`.
 
-        if not has_next or not items:
-            break
-        offset += limit
+Раньше было 39 продуктов и ожидалось 37. Значит, в ASOC, похоже, появился ещё один продукт. Посмотри полный рабочий список:
 
-    log.info(f"Итого дефектов: {len(all_issues)}")
-    return all_issues
+```sql
+SELECT
+    product_id,
+    product_name,
+    product_slug,
+    criticality,
+    repos_count
+FROM custom_ts_secure_development.dim_product
+ORDER BY product_name;
+```
 
+Если по бизнес-логике продуктов должно быть строго 37, найдём в этом списке третий технический продукт и исключим его по UUID.
 
-async def fetch_products(session: aiohttp.ClientSession) -> list:
-    if not SPACE_ID:
-        log.warning("VAMPY_SPACE_ID не задан — продукты пропускаем")
-        return []
+## 4. Проверка связи repository → product
 
-    log.info(f"Запрашиваем продукты /api/spaces/{SPACE_ID}/products/ ...")
-    all_products = []
-    offset = 0
-    limit  = 60
+```sql
+WITH repositories AS (
+    SELECT DISTINCT repository_id
+    FROM custom_ts_secure_development.issues_current_all
+    WHERE repository_id IS NOT NULL
+),
+mapped AS (
+    SELECT DISTINCT repository_id
+    FROM custom_ts_secure_development.repository_product_current
+)
+SELECT
+    COUNT(*) AS total_repositories,
+    SUM(
+        CASE WHEN m.repository_id IS NOT NULL
+             THEN 1 ELSE 0 END
+    ) AS mapped_repositories,
+    SUM(
+        CASE WHEN m.repository_id IS NULL
+             THEN 1 ELSE 0 END
+    ) AS unmapped_repositories,
+    (
+        SELECT COUNT(*)
+        FROM custom_ts_secure_development.repository_product_current
+    ) AS working_relations
+FROM repositories r
+LEFT JOIN mapped m
+  ON m.repository_id = r.repository_id;
+```
 
-    while True:
-        async with session.get(
-            f"{VAMPY_URL}/api/spaces/{SPACE_ID}/products/",
-            headers=HEADERS,
-            params={"limit": limit, "offset": offset},
-            timeout=aiohttp.ClientTimeout(total=60)
-        ) as r:
-            if r.status != 200:
-                text = await r.text()
-                log.error(f"Ошибка продуктов {r.status}: {text[:200]}")
-                break
-            data = await r.json()
+Ожидаем по логу:
 
-        items    = data.get("items", [])
-        has_next = data.get("hasNext", False)
-        total    = data.get("totalCount", "?")
-        all_products.extend(items)
+```text
+total_repositories    = 907
+mapped_repositories   = 729
+unmapped_repositories = 178
+working_relations     = 799
+```
 
-        log.info(f"Продукты: {len(all_products)} / {total}")
+799 больше 729 — это нормально: некоторые репозитории относятся сразу к нескольким продуктам.
 
-        if not has_next or not items:
-            break
-        offset += limit
+## 5. Сколько дефектов реально попало в продукты
 
-    return all_products
+Это сейчас самая важная проверка:
 
+```sql
+SELECT
+    (
+        SELECT COUNT(*)
+        FROM custom_ts_secure_development.issues_current
+    ) AS dashboard_issues,
 
-def prepare_issue_rows(items: list, snapshot_ts: datetime) -> list:
-    rows = []
-    for item in items:
-        # Статус — храним как есть из Vampy
-        raw_status = (item.get("status") or "").lower().strip()
-        severity   = normalize_severity(item.get("severity", ""))
+    (
+        SELECT COUNT(DISTINCT issue_id)
+        FROM custom_ts_secure_development.issues_current_by_product
+    ) AS mapped_distinct_issues,
 
-        # is_security_debt — статус security-debt
-        is_debt   = (raw_status == "security-debt")
+    (
+        SELECT COUNT(*)
+        FROM custom_ts_secure_development.issues_unmapped_current
+    ) AS unmapped_issues,
 
-        # is_active — открытый или закрытый
-        is_active = (raw_status not in CLOSED_STATUSES)
+    (
+        SELECT COUNT(*)
+        FROM custom_ts_secure_development.issues_current_by_product
+    ) AS product_issue_rows;
+```
 
-        # repository — объект
-        repo = item.get("repository") or {}
-        repo_name = repo.get("name", repo.get("slug", "")) if isinstance(repo, dict) else str(repo)
+Проверяем равенство:
 
-        # product — может быть null
-        product = item.get("product") or {}
-        if isinstance(product, dict) and product:
-            product_id   = str(product.get("id", ""))
-            product_name = product.get("name", product.get("slug", ""))
-        else:
-            product_id   = ""
-            product_name = ""
+```text
+dashboard_issues =
+mapped_distinct_issues + unmapped_issues
+```
 
-        rows.append((
-            snapshot_ts,
-            str(item.get("id", "")),
-            product_id,
-            product_name,
-            repo_name,
-            severity,
-            raw_status,              # оригинальный статус из Vampy
-            str(item.get("parser", "") or ""),
-            is_debt,
-            is_active,
-            parse_dt(item.get("created")),
-            parse_dt(item.get("completed")),
-            parse_dt(item.get("sla")),
-        ))
-    return rows
+`product_issue_rows` может быть больше `mapped_distinct_issues` — это правильно, потому что один дефект может отображаться в нескольких продуктах.
 
+## 6. Почему 178 репозиториев остались без рабочего продукта
 
-def prepare_product_rows(products: list, snapshot_ts: datetime) -> list:
-    rows = []
-    for p in products:
-        rows.append((
-            snapshot_ts,
-            str(p.get("id", "")),
-            str(p.get("name", p.get("slug", ""))),
-            int(p.get("repositoriesCount", 0)),
-        ))
-    return rows
+Этот запрос разделит их на две группы:
 
+* репозиторий связан только с исключёнными `TEST`/`Default product`;
+* API вообще не вернул продукт.
 
-def save_to_greenplum(issue_rows: list, product_rows: list, snapshot_ts: datetime):
-    dsn = (
-        f"host={GP_HOST} port={GP_PORT} dbname={GP_DB} "
-        f"user={GP_USER} password={GP_PASSWORD}"
-    )
-    conn = psycopg2.connect(dsn)
-    cur  = conn.cursor()
+```sql
+WITH unmapped AS (
+    SELECT
+        issue_id,
+        repository_id,
+        repository
+    FROM custom_ts_secure_development.issues_unmapped_current
+),
+classified AS (
+    SELECT
+        u.*,
+        CASE
+            WHEN EXISTS (
+                SELECT 1
+                FROM custom_ts_secure_development.repository_product_current_all rp
+                WHERE rp.repository_id = u.repository_id
+                  AND rp.product_id IN (
+                      'd569ed52-b01f-4222-948b-705b008ae64a',
+                      '1a16d04d-cd14-4894-b887-4ba7465c26aa'
+                  )
+            )
+            THEN 'ONLY TEST / DEFAULT PRODUCT'
+            ELSE 'API RETURNED NO PRODUCT'
+        END AS unmapped_reason
+    FROM unmapped u
+)
+SELECT
+    unmapped_reason,
+    COUNT(DISTINCT repository_id) AS repositories,
+    COUNT(DISTINCT issue_id) AS issues
+FROM classified
+GROUP BY unmapped_reason
+ORDER BY unmapped_reason;
+```
 
-    log.info(f"Пишем {len(issue_rows)} дефектов в issues_snapshot...")
-    execute_values(cur, f"""
-        INSERT INTO {GP_SCHEMA}.issues_snapshot (
-            ts, issue_id, product_id, product_name, repository,
-            severity, status, scanner, is_security_debt, is_active,
-            created_at, updated_at, ra_deadline
-        ) VALUES %s
-    """, issue_rows, page_size=500)
+И топ непривязанных репозиториев:
 
-    if product_rows:
-        log.info(f"Пишем {len(product_rows)} продуктов в products_snapshot...")
-        execute_values(cur, f"""
-            INSERT INTO {GP_SCHEMA}.products_snapshot (
-                ts, product_id, product_name, repos_count
-            ) VALUES %s
-        """, product_rows)
+```sql
+SELECT
+    repository_id,
+    repository,
+    COUNT(*) AS issues_count,
+    SUM(CASE WHEN severity = 'CRITICAL' THEN 1 ELSE 0 END)
+        AS critical_count,
+    SUM(CASE WHEN severity = 'HIGH' THEN 1 ELSE 0 END)
+        AS high_count
+FROM custom_ts_secure_development.issues_unmapped_current
+GROUP BY repository_id, repository
+ORDER BY issues_count DESC
+LIMIT 30;
+```
 
-    log.info("Обновляем дневные агрегаты...")
-    today = snapshot_ts.date()
-    cur.execute(f"DELETE FROM {GP_SCHEMA}.issues_daily WHERE dt = %s", (today,))
-    cur.execute(f"""
-        INSERT INTO {GP_SCHEMA}.issues_daily (
-            dt, product_id, product_name,
-            severity, status, scanner, is_security_debt, cnt
+Если большинство относится только к `TEST`/`Default product`, всё нормально. Если много строк в `API RETURNED NO PRODUCT`, часть данных действительно не попадёт в продуктовые дашборды.
+
+## 7. Проверка исключений
+
+```sql
+SELECT
+    (
+        SELECT COUNT(*)
+        FROM custom_ts_secure_development.issues_current_all
+        WHERE status = 'check_required'
+    ) AS check_required_in_raw,
+
+    (
+        SELECT COUNT(*)
+        FROM custom_ts_secure_development.issues_current
+        WHERE status = 'check_required'
+    ) AS check_required_in_dashboard,
+
+    (
+        SELECT COUNT(*)
+        FROM custom_ts_secure_development.dim_product
+        WHERE product_id IN (
+            'd569ed52-b01f-4222-948b-705b008ae64a',
+            '1a16d04d-cd14-4894-b887-4ba7465c26aa'
         )
-        SELECT
-            DATE(ts), product_id, product_name,
-            severity, status, scanner, is_security_debt,
-            COUNT(DISTINCT issue_id)
-        FROM {GP_SCHEMA}.issues_snapshot
-        WHERE ts = (SELECT MAX(ts) FROM {GP_SCHEMA}.issues_snapshot)
-        GROUP BY
-            DATE(ts), product_id, product_name,
-            severity, status, scanner, is_security_debt
-    """)
+    ) AS excluded_products_in_dashboard;
+```
 
-    conn.commit()
-    cur.close()
-    conn.close()
-    log.info("Greenplum обновлён.")
+Ожидаем:
 
+```text
+check_required_in_dashboard     = 0
+excluded_products_in_dashboard  = 0
+```
 
-async def main():
-    snapshot_ts = datetime.now(timezone.utc)
-    log.info(f"=== Старт: {snapshot_ts} ===")
+`check_required_in_raw` может быть больше нуля — так и задумано.
 
-    async with aiohttp.ClientSession() as session:
-        issues, products = await asyncio.gather(
-            fetch_issues(session),
-            fetch_products(session),
-        )
+## 8. Нет ли дублей issue внутри одного продукта
 
-    if not issues:
-        log.warning("Дефектов не получено — пропускаем.")
-        return
+```sql
+SELECT
+    issue_id,
+    product_id,
+    COUNT(*) AS cnt
+FROM custom_ts_secure_development.issues_current_by_product
+GROUP BY issue_id, product_id
+HAVING COUNT(*) > 1
+ORDER BY cnt DESC;
+```
 
-    issue_rows   = prepare_issue_rows(issues, snapshot_ts)
-    product_rows = prepare_product_rows(products, snapshot_ts)
-    save_to_greenplum(issue_rows, product_rows, snapshot_ts)
-    log.info("=== Готово ===")
+Должно быть **0 строк**.
 
+## 9. Арифметика KPI по продуктам
 
-if __name__ == "__main__":
-    asyncio.run(main())
+```sql
+SELECT
+    product_id,
+    product_name,
+    open_total,
+    open_total_critical,
+    open_total_high,
+    open_current_flow,
+    security_debt_total
+FROM custom_ts_secure_development.appsec_kpi_by_product
+WHERE open_total <> open_total_critical + open_total_high
+   OR open_total <> open_current_flow + security_debt_total;
+```
+
+Должно быть **0 строк**.
+
+Посмотреть итоговую таблицу для FineBI:
+
+```sql
+SELECT
+    product_name,
+    repos_count,
+    open_total,
+    open_total_critical,
+    open_total_high,
+    confirmed_total,
+    reopened_total,
+    risk_accepted_total,
+    security_debt_total,
+    red_zone_total
+FROM custom_ts_secure_development.products_comparison_current
+ORDER BY red_zone_total DESC, open_total DESC;
+```
+
+Здесь уже должны быть ненулевые показатели.
+
+## 10. Красная зона
+
+```sql
+SELECT
+    (
+        SELECT red_zone_total
+        FROM custom_ts_secure_development.appsec_summary
+    ) AS global_red_zone_issues,
+
+    (
+        SELECT COUNT(DISTINCT issue_id)
+        FROM custom_ts_secure_development.red_zone
+    ) AS mapped_red_zone_issues,
+
+    (
+        SELECT COUNT(*)
+        FROM custom_ts_secure_development.red_zone
+    ) AS product_red_zone_rows;
+```
+
+`product_red_zone_rows` может быть больше числа уникальных дефектов из-за связи одного репозитория с несколькими продуктами.
+
+Посмотреть реальные строки:
+
+```sql
+SELECT
+    product_name,
+    repository,
+    issue_title,
+    severity,
+    status_display,
+    days_in_status,
+    priority_order
+FROM custom_ts_secure_development.red_zone
+ORDER BY priority_order, days_in_status DESC
+LIMIT 50;
+```
+
+Теперь результат не должен быть пустым.
+
+## 11. Проверка событий статусов
+
+```sql
+SELECT
+    COUNT(*) AS total_events,
+    COUNT(DISTINCT event_id) AS unique_events,
+    SUM(CASE WHEN is_baseline THEN 1 ELSE 0 END) AS baseline_events,
+    SUM(CASE WHEN NOT is_baseline THEN 1 ELSE 0 END) AS real_transitions,
+    MAX(event_ts) AS latest_event_ts
+FROM custom_ts_secure_development.issue_status_events;
+```
+
+Проверка дублей:
+
+```sql
+SELECT
+    event_id,
+    COUNT(*) AS cnt
+FROM custom_ts_secure_development.issue_status_events
+GROUP BY event_id
+HAVING COUNT(*) > 1;
+```
+
+Должно быть **0 строк**.
+
+## 12. Проверка заполненности важных полей
+
+```sql
+SELECT
+    COUNT(*) AS total,
+    COUNT(issue_title) AS with_title,
+    COUNT(repository_id) AS with_repository_id,
+    COUNT(issue_url) AS with_url,
+    COUNT(status_changed_at) AS with_status_changed_at,
+    COUNT(ra_deadline) AS with_ra_deadline
+FROM custom_ts_secure_development.issues_current_all;
+```
+
+Ожидаем:
+
+```text
+with_title          = total
+with_repository_id  = total
+```
+
+`with_url` и `with_status_changed_at` могут остаться нулевыми — API их в найденном ответе не отдавал. Основные KPI от этого работают, но кликабельная ссылка на дефект и точный возраст текущего статуса пока ограничены.
+
+Сначала пришли результаты запросов **3, 5 и 6**. По ним сразу будет понятно, готовы ли продуктовые данные к подключению в FineBI или надо разобраться с частью 178 репозиториев.
