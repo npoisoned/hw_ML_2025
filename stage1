@@ -1,0 +1,879 @@
+Ниже итоговый план от текущего состояния до готового опубликованного решения. Мы не переделываем Greenplum: модель уже работает. Теперь задача — аккуратно собрать FineBI поверх готовых представлений.
+
+# Какой результат строим
+
+В FineBI будет одна новая рабочая книга:
+
+```text
+Мониторинг уязвимостей — AppSec v2
+```
+
+В ней четыре связанных дашборда:
+
+1. **Общий обзор** — текущее состояние AppSec.
+2. **Сравнение продуктов** — какие продукты наиболее проблемные.
+3. **Красная зона** — конкретные Confirmed/Reopened для работы.
+4. **Security Debt и эффективность** — прогресс, скорость устранения и MTTR.
+
+Пользовательский сценарий:
+
+```text
+Общий обзор
+    ↓ клик по проблемному продукту
+Сравнение продуктов
+    ↓ переход с выбранным product_id
+Красная зона
+    ↓ фильтрация по репозиторию
+Список конкретных дефектов
+```
+
+Отдельная вкладка показывает Security Debt, прогноз и эффективность устранения.
+
+# Что уже работает в данных
+
+Python и Greenplum уже дают готовую модель:
+
+```text
+Сырых Critical/High:             33 027
+Рабочих дефектов для дашбордов:  25 960
+Продуктовых строк:               28 114
+Исключено технических дефектов:   7 067
+```
+
+Разница между `25 960` и `28 114` нормальная: один репозиторий может входить в несколько продуктов.
+
+Из всех бизнес-дашбордов исключены:
+
+```text
+check_required
+TEST
+Default product
+```
+
+Сырые записи сохраняются для технического контроля, но в KPI не участвуют.
+
+# Этап 1. Не трогать старую книгу
+
+На скрине уже есть старая рабочая книга:
+
+```text
+Мониторинг уязвимостей — AppSec
+```
+
+Её не удаляем и не переделываем. Она остаётся резервной копией.
+
+Создаём новую:
+
+```text
+Мониторинг уязвимостей — AppSec v2
+```
+
+Так мы не смешаем старые SQL-датасеты, старые формулы и новую модель Greenplum.
+
+# Этап 2. Подготовить отдельную папку источников
+
+В разделе:
+
+```text
+Источники
+→ Direct
+→ Управление безопасности
+→ Данные
+```
+
+создаём папку:
+
+```text
+AppSec_v2
+```
+
+Все новые датасеты храним только там.
+
+Старые:
+
+```text
+security_debt_forecast
+products_full
+issues_daily
+issues_current
+appsec_summary
+products_current
+```
+
+не удаляем, но в новую рабочую книгу не добавляем.
+
+# Этап 3. Создать SQL-датасеты
+
+Каждый датасет создаётся как Direct SQL Dataset с простым запросом:
+
+```sql
+SELECT *
+FROM custom_ts_secure_development.<view_name>;
+```
+
+## Датасеты для общего дашборда
+
+### `01_appsec_summary`
+
+```sql
+SELECT *
+FROM custom_ts_secure_development.appsec_summary;
+```
+
+Ожидаем одну строку. Это готовые глобальные KPI.
+
+### `02_data_freshness`
+
+```sql
+SELECT *
+FROM custom_ts_secure_development.data_freshness;
+```
+
+Ожидаем одну строку:
+
+```text
+last_snapshot_ts
+hours_since_last_snapshot
+freshness_status
+```
+
+### `03_issues_current`
+
+```sql
+SELECT *
+FROM custom_ts_secure_development.issues_current;
+```
+
+Ожидаем около `25 960` строк. Здесь один дефект представлен один раз.
+
+### `04_issues_daily_flow_global`
+
+```sql
+SELECT *
+FROM custom_ts_secure_development.issues_daily_flow_global;
+```
+
+Глобальная динамика поступления и устранения дефектов.
+
+### `05_products_comparison_current`
+
+```sql
+SELECT *
+FROM custom_ts_secure_development.products_comparison_current;
+```
+
+Одна строка на рабочий продукт.
+
+### `06_red_zone`
+
+```sql
+SELECT *
+FROM custom_ts_secure_development.red_zone;
+```
+
+Конкретные Confirmed и Reopened с продуктом и репозиторием.
+
+## Датасеты для последующих страниц
+
+### `07_issues_current_by_product`
+
+```sql
+SELECT *
+FROM custom_ts_secure_development.issues_current_by_product;
+```
+
+Один дефект может присутствовать в нескольких продуктах.
+
+### `08_issues_daily_flow`
+
+```sql
+SELECT *
+FROM custom_ts_secure_development.issues_daily_flow;
+```
+
+Динамика статусов по продуктам.
+
+### `09_repository_daily_flow`
+
+```sql
+SELECT *
+FROM custom_ts_secure_development.repository_daily_flow;
+```
+
+Динамика по репозиториям.
+
+### `10_effectiveness_by_product`
+
+```sql
+SELECT *
+FROM custom_ts_secure_development.effectiveness_by_product;
+```
+
+Поступило, устранено и net reduction за период.
+
+### `11_mttr_by_product`
+
+```sql
+SELECT *
+FROM custom_ts_secure_development.mttr_by_product;
+```
+
+MTTR по продуктам и severity.
+
+### `12_security_debt_summary_by_product`
+
+```sql
+SELECT *
+FROM custom_ts_secure_development.security_debt_summary_by_product;
+```
+
+Текущий долг, прогресс, скорость и прогноз.
+
+### `13_security_debt_chart`
+
+```sql
+SELECT *
+FROM custom_ts_secure_development.security_debt_chart;
+```
+
+Факт, план и прогноз по датам.
+
+### `14_issues_daily_stock_summary`
+
+```sql
+SELECT *
+FROM custom_ts_secure_development.issues_daily_stock_summary;
+```
+
+Исторический остаток открытых дефектов и Security Debt.
+
+# Этап 4. Проверить датасеты до создания графиков
+
+Перед сборкой компонентов проверяем предпросмотр.
+
+Ожидаем:
+
+| Датасет                          |                     Проверка |
+| -------------------------------- | ---------------------------: |
+| `01_appsec_summary`              |                     1 строка |
+| `02_data_freshness`              |                     1 строка |
+| `03_issues_current`              |           около 25 960 строк |
+| `05_products_comparison_current` | количество рабочих продуктов |
+| `06_red_zone`                    |                    не пустой |
+| `07_issues_current_by_product`   |           около 28 114 строк |
+
+В `03_issues_current` не должно быть:
+
+```text
+check_required
+```
+
+В продуктах не должно быть:
+
+```text
+TEST
+Default product
+```
+
+# Этап 5. Создать новую рабочую книгу
+
+В `Песочнице`:
+
+```text
+Новая рабочая книга
+```
+
+Название:
+
+```text
+Мониторинг уязвимостей — AppSec v2
+```
+
+Добавляем в неё датасеты из `AppSec_v2`.
+
+Создаём четыре листа-дашборда:
+
+```text
+D01 — Общий обзор
+D02 — Сравнение продуктов
+D03 — Красная зона
+D04 — Security Debt и эффективность
+```
+
+Компоненты называем последовательно:
+
+```text
+C01 — KPI Открыто
+C02 — KPI Critical
+C03 — KPI High
+C04 — KPI Красная зона
+...
+```
+
+Так будет понятно, что к какому дашборду относится.
+
+# Этап 6. Построить дашборд D01 — «Общий обзор»
+
+## Какой вопрос он решает
+
+Руководитель или AppSec за несколько секунд должен понять:
+
+* сколько сейчас открытых Critical/High;
+* сколько дефектов в красной зоне;
+* сколько находится в Security Debt;
+* сколько Risk Accepted;
+* растёт поток или уменьшается;
+* какие продукты требуют внимания.
+
+## Верхняя строка
+
+Заголовок:
+
+```text
+Мониторинг уязвимостей — AppSec
+```
+
+Справа:
+
+```text
+Последняя загрузка: <last_snapshot_ts>
+Статус данных: OK / STALE
+```
+
+Источник — `02_data_freshness`.
+
+## KPI-карточки
+
+Источник — `01_appsec_summary`.
+
+Карточки:
+
+| Название      | Поле                  |
+| ------------- | --------------------- |
+| Открыто всего | `open_total`          |
+| Critical      | `open_critical`       |
+| High          | `open_high`           |
+| Красная зона  | `red_zone_total`      |
+| Security Debt | `security_debt_total` |
+| Risk Accepted | `risk_accepted_total` |
+
+Агрегация для каждой карточки:
+
+```text
+MAX
+```
+
+Поскольку в датасете одна строка.
+
+Не использовать `issues_total` как «Открыто»: оно может включать закрытые текущие записи.
+
+## График «Открытые по статусам»
+
+Источник — `03_issues_current`.
+
+Фильтр:
+
+```text
+is_unresolved_int = 1
+```
+
+Настройки:
+
+```text
+Тип: горизонтальная столбчатая диаграмма
+Категория: status_display
+Показатель: COUNT_DISTINCT(issue_id)
+Сортировка: по убыванию
+```
+
+Результат: видно, сколько New, Recurrent, Confirmed, Risk Accepted, Reopened и Security Debt.
+
+## Диаграмма Critical / High
+
+Источник — `03_issues_current`.
+
+Фильтр:
+
+```text
+is_unresolved_int = 1
+```
+
+Настройки:
+
+```text
+Тип: кольцевая диаграмма
+Категория: severity
+Показатель: COUNT_DISTINCT(issue_id)
+```
+
+Результат: доля Critical и High в открытом портфеле.
+
+## Динамика поступления и устранения
+
+Источник — `04_issues_daily_flow_global`.
+
+Расчёты:
+
+```text
+Поступило =
+new_cnt + recurrent_cnt + reopened_cnt
+```
+
+```text
+Устранено =
+fixed_cnt + false_positive_cnt + exclusion_cnt
+```
+
+Компонент:
+
+```text
+Ось X: dt
+Поступило: столбцы
+Устранено: линия
+```
+
+Результат: видно, справляемся ли мы с входящим потоком.
+
+Первые дни график будет коротким: история начала корректно накапливаться с новой версии Python.
+
+## Топ продуктов по красной зоне
+
+Источник — `05_products_comparison_current`.
+
+```text
+Категория: product_name
+Показатель: red_zone_total
+Тип: горизонтальная столбчатая диаграмма
+Top: 10
+Сортировка: по убыванию
+```
+
+Результат: сразу видно, какие продукты требуют эскалации.
+
+## Раскладка D01
+
+```text
+Строка 1:
+Заголовок                         Свежесть данных
+
+Строка 2:
+Открыто | Critical | High | Красная зона | Security Debt | Risk Accepted
+
+Строка 3:
+Открытые по статусам             Critical / High
+
+Строка 4:
+Динамика поступления и устранения
+
+Строка 5:
+Топ продуктов по красной зоне
+```
+
+# Этап 7. Построить D02 — «Сравнение продуктов»
+
+## Какой вопрос он решает
+
+* где больше Critical;
+* где больше красная зона;
+* где накапливается Security Debt;
+* какие продукты требуют внимания в первую очередь.
+
+## Источник
+
+```text
+05_products_comparison_current
+```
+
+## Верхние показатели
+
+Карточки:
+
+```text
+Количество продуктов
+Продуктов с красной зоной
+Продуктов с Security Debt
+Продуктов с Critical
+```
+
+Используем `COUNT_DISTINCT(product_id)` с соответствующими фильтрами.
+
+## Основная таблица
+
+Колонки:
+
+```text
+product_name
+criticality
+repos_count
+open_total
+open_total_critical
+open_total_high
+confirmed_total
+reopened_total
+risk_accepted_total
+security_debt_total
+red_zone_total
+nearest_ra_deadline
+risk_accepted_due_7d
+risk_accepted_due_14d
+```
+
+Сортировка:
+
+```text
+red_zone_total DESC
+open_total_critical DESC
+open_total DESC
+```
+
+Результат: ранжированный список продуктов.
+
+## График Critical / High
+
+```text
+Тип: горизонтальные сгруппированные столбцы
+Категория: product_name
+Показатели:
+    open_total_critical
+    open_total_high
+Top: 10–15
+```
+
+## Фильтры
+
+```text
+product_name
+criticality
+```
+
+## Переход
+
+Клик по продукту:
+
+```text
+Jump → D03 — Красная зона
+product_id → product_id
+```
+
+Передавать UUID, не название.
+
+# Этап 8. Построить D03 — «Красная зона»
+
+## Какой вопрос он решает
+
+Это рабочий экран: какие конкретные дефекты необходимо разбирать прямо сейчас.
+
+## Источник
+
+```text
+06_red_zone
+```
+
+## Фильтры
+
+```text
+product_name
+repository
+severity
+status_display
+scanner
+```
+
+## KPI
+
+```text
+Количество уникальных дефектов
+Critical
+Reopened
+Количество репозиториев
+Максимальный возраст
+```
+
+Для дефектов использовать:
+
+```text
+COUNT_DISTINCT(issue_id)
+```
+
+Потому что один issue может отображаться в нескольких продуктах.
+
+## Топ репозиториев
+
+```text
+Категория: repository
+Показатель: COUNT_DISTINCT(issue_id)
+Тип: горизонтальная столбчатая диаграмма
+Top: 15
+```
+
+## Детальная таблица
+
+Колонки:
+
+```text
+severity
+status_display
+days_in_status
+product_name
+repository
+issue_title
+scanner
+library_name
+library_version
+cve_id
+cwe_id
+created_at
+ra_deadline
+```
+
+Сортировка:
+
+```text
+priority_order ASC
+days_in_status DESC
+```
+
+Результат: сверху самые приоритетные Critical/Reopened, ниже остальные.
+
+## Интерактивность
+
+Клик по репозиторию в графике должен фильтровать таблицу через Linkage.
+
+Позже можно добавить переход в Vampy по `issue_url`. Пока URL не заполнен, таблица просто показывает данные без перехода.
+
+# Этап 9. Построить D04 — «Security Debt и эффективность»
+
+Делаем две вкладки:
+
+```text
+Security Debt
+Эффективность
+```
+
+## Вкладка Security Debt
+
+Источники:
+
+```text
+12_security_debt_summary_by_product
+13_security_debt_chart
+```
+
+Фильтр:
+
+```text
+product_name
+```
+
+Карточки:
+
+```text
+Начальный долг
+Текущий остаток
+Устранено
+Прогресс, %
+Critical
+High
+Требуемая скорость
+Прогноз на дедлайн
+```
+
+График:
+
+```text
+Ось X: dt
+actual_remaining — факт
+target_remaining — план
+forecast_remaining — прогноз
+```
+
+Результат: видно, успеет ли продукт погасить долг к дедлайну.
+
+## Вкладка «Эффективность»
+
+Источники:
+
+```text
+10_effectiveness_by_product
+11_mttr_by_product
+14_issues_daily_stock_summary
+```
+
+Показываем:
+
+```text
+Поступило за 28 дней
+Устранено за 28 дней
+Net reduction
+Средний MTTR
+Медианный MTTR
+Исторический остаток
+```
+
+Результат: понятно, действительно ли команда сокращает объём проблем.
+
+MTTR и скорость сначала могут быть пустыми или нестабильными, пока не накопится история переходов.
+
+# Этап 10. Настроить общую интерактивность
+
+## Linkage внутри страницы
+
+```text
+Клик по продукту → фильтрует остальные компоненты
+Клик по репозиторию → фильтрует таблицу дефектов
+```
+
+## Jump между страницами
+
+```text
+D01 → D02
+D02 → D03
+D03 → D04
+```
+
+Передаваемые ключи:
+
+```text
+product_id
+repository_id
+```
+
+Не строить связи по названию: названия могут измениться.
+
+# Этап 11. Оформление
+
+Единая цветовая система:
+
+```text
+Critical — красный
+High — оранжевый
+Confirmed — красный
+Reopened — тёмно-оранжевый
+Risk Accepted — жёлтый
+Security Debt — фиолетовый
+Устранено — зелёный
+План — серый
+Прогноз — синий
+```
+
+Правила:
+
+* одинаковый показатель на всех страницах имеет одинаковый цвет;
+* не назначать каждому продукту отдельный цвет;
+* таблицы использовать для детализации;
+* основные выводы показывать через KPI и графики;
+* длинные названия продуктов и репозиториев показывать горизонтальными диаграммами.
+
+# Этап 12. Сверка с Greenplum
+
+Перед публикацией каждый ключевой показатель FineBI сравниваем с DBeaver.
+
+## Глобальные KPI
+
+```sql
+SELECT *
+FROM custom_ts_secure_development.appsec_summary;
+```
+
+## Статусы
+
+```sql
+SELECT
+    status_display,
+    COUNT(DISTINCT issue_id) AS issues
+FROM custom_ts_secure_development.issues_current
+WHERE is_unresolved_int = 1
+GROUP BY status_display
+ORDER BY issues DESC;
+```
+
+## Severity
+
+```sql
+SELECT
+    severity,
+    COUNT(DISTINCT issue_id) AS issues
+FROM custom_ts_secure_development.issues_current
+WHERE is_unresolved_int = 1
+GROUP BY severity;
+```
+
+## Красная зона
+
+```sql
+SELECT COUNT(DISTINCT issue_id)
+FROM custom_ts_secure_development.red_zone;
+```
+
+## Конкретный продукт
+
+```sql
+SELECT *
+FROM custom_ts_secure_development.products_comparison_current
+WHERE product_id = '<UUID>';
+```
+
+FineBI должен показывать те же значения.
+
+# Этап 13. Публикация и права
+
+После проверки:
+
+1. Заполняем `user_product_access`.
+2. Настраиваем ограничение строк для разработчиков.
+3. Проверяем дашборд под обычным пользователем.
+4. Проверяем под администратором.
+5. Отправляем заявку на публикацию.
+6. Старую книгу оставляем до окончательного принятия новой.
+
+# Что будет происходить дальше автоматически
+
+Обычный рабочий процесс:
+
+```text
+Запускается Python v7
+    ↓
+Новый snapshot записывается в Greenplum
+    ↓
+SQL views автоматически показывают новые данные
+    ↓
+FineBI Direct получает актуальные значения
+```
+
+При обычном повторном запуске Python:
+
+```text
+SQL в DBeaver заново запускать не надо
+датасеты пересоздавать не надо
+компоненты перестраивать не надо
+```
+
+В FineBI может быть небольшая задержка из-за Direct cache.
+
+# Какой конечный результат
+
+После завершения у нас будет единая система, в которой:
+
+* глобальные дефекты считаются без дублей;
+* продуктовые дефекты корректно отображаются во всех связанных продуктах;
+* TEST, Default product и `check_required` нигде не видны;
+* видны только рабочие Critical и High;
+* можно перейти от общего KPI до конкретного дефекта;
+* красная зона показывает Confirmed и Reopened;
+* Security Debt показывает факт, план и прогноз;
+* эффективность показывает входящий поток, устранение и MTTR;
+* данные обновляются обычным запуском Python без повторного изменения SQL.
+
+## Что делаем первым
+
+Сейчас ближайшие действия:
+
+1. Создать папку `AppSec_v2` в источниках.
+2. Создать `01_appsec_summary`.
+3. Создать `02_data_freshness`.
+4. Создать `03_issues_current`.
+5. Открыть предпросмотр и проверить строки и колонки.
+6. Создать новую книгу `Мониторинг уязвимостей — AppSec v2`.
+7. Собрать первую карточку `C01 — KPI Открыто`.
+8. После неё собрать остальные пять KPI.
+9. Только после сверки KPI переходить к графикам.
